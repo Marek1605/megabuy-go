@@ -59,7 +59,6 @@ func main() {
 	api.Get("/categories/:slug", h.GetCategoryBySlug)
 	api.Get("/categories/:slug/products", h.GetProductsByCategory)
 	api.Get("/stats", h.GetStats)
-	api.Get("/products/:id/offers", h.GetProductOffers)
 
 	admin := api.Group("/admin")
 	admin.Get("/dashboard", h.AdminDashboard)

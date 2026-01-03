@@ -585,3 +585,79 @@ func (h *Handlers) UploadImage(c *fiber.Ctx) error {
 	url := fmt.Sprintf("%s/uploads/%s", baseURL, filename)
 	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"url": url, "filename": filename}})
 }
+
+// GetProductOffers returns all offers for a product
+func (h *Handlers) GetProductOffers(c *fiber.Ctx) error {
+	productID := c.Params("id")
+	ctx := context.Background()
+	
+	// Get offers from database
+	rows, err := h.db.Pool.Query(ctx, `
+		SELECT o.id, o.vendor_id, COALESCE(v.name,'MegaBuy.sk'), COALESCE(v.logo_url,''), 
+		       COALESCE(v.rating, 4.8), COALESCE(v.review_count, 1250),
+		       o.price, COALESCE(o.shipping_price, 0), COALESCE(o.delivery_days, '1-2'),
+		       COALESCE(o.stock_status, 'instock'), COALESCE(o.stock_quantity, 10),
+		       COALESCE(o.is_megabuy, true), COALESCE(o.affiliate_url, '')
+		FROM offers o
+		LEFT JOIN vendors v ON o.vendor_id = v.id
+		WHERE o.product_id = $1::uuid AND o.is_active = true
+		ORDER BY o.price ASC
+	`, productID)
+	
+	if err != nil {
+		// If no offers table or error, return default MegaBuy offer
+		var priceMin float64
+		var stockStatus string
+		h.db.Pool.QueryRow(ctx, "SELECT price_min, COALESCE(stock_status,'instock') FROM products WHERE id = $1::uuid", productID).Scan(&priceMin, &stockStatus)
+		
+		shippingPrice := 2.99
+		if priceMin >= 49 { shippingPrice = 0 }
+		
+		return c.JSON(fiber.Map{"success": true, "data": []fiber.Map{{
+			"id": "default", "vendor_id": "megabuy", "vendor_name": "MegaBuy.sk",
+			"vendor_logo": "", "vendor_rating": 4.8, "vendor_reviews": 1250,
+			"price": priceMin, "shipping_price": shippingPrice, "delivery_days": "1-2",
+			"stock_status": stockStatus, "stock_quantity": 10, "is_megabuy": true, "affiliate_url": "",
+		}}})
+	}
+	defer rows.Close()
+
+	var offers []fiber.Map
+	for rows.Next() {
+		var id, vendorID, vendorName, vendorLogo, deliveryDays, stockStatus, affiliateURL string
+		var vendorRating float64
+		var vendorReviews, stockQty int
+		var price, shippingPrice float64
+		var isMegabuy bool
+		
+		rows.Scan(&id, &vendorID, &vendorName, &vendorLogo, &vendorRating, &vendorReviews,
+			&price, &shippingPrice, &deliveryDays, &stockStatus, &stockQty, &isMegabuy, &affiliateURL)
+		
+		offers = append(offers, fiber.Map{
+			"id": id, "vendor_id": vendorID, "vendor_name": vendorName,
+			"vendor_logo": vendorLogo, "vendor_rating": vendorRating, "vendor_reviews": vendorReviews,
+			"price": price, "shipping_price": shippingPrice, "delivery_days": deliveryDays,
+			"stock_status": stockStatus, "stock_quantity": stockQty, "is_megabuy": isMegabuy,
+			"affiliate_url": affiliateURL,
+		})
+	}
+
+	// If no offers found, return default
+	if len(offers) == 0 {
+		var priceMin float64
+		var stockStatus string
+		h.db.Pool.QueryRow(ctx, "SELECT price_min, COALESCE(stock_status,'instock') FROM products WHERE id = $1::uuid", productID).Scan(&priceMin, &stockStatus)
+		
+		shippingPrice := 2.99
+		if priceMin >= 49 { shippingPrice = 0 }
+		
+		offers = []fiber.Map{{
+			"id": "default", "vendor_id": "megabuy", "vendor_name": "MegaBuy.sk",
+			"vendor_logo": "", "vendor_rating": 4.8, "vendor_reviews": 1250,
+			"price": priceMin, "shipping_price": shippingPrice, "delivery_days": "1-2",
+			"stock_status": stockStatus, "stock_quantity": 10, "is_megabuy": true, "affiliate_url": "",
+		}}
+	}
+
+	return c.JSON(fiber.Map{"success": true, "data": offers})
+}
