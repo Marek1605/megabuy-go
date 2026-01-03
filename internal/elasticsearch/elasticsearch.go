@@ -396,3 +396,21 @@ type esBucketAgg struct {
 		DocCount int64  `json:"doc_count"`
 	} `json:"buckets"`
 }
+
+// DeleteIndex deletes the products index
+func (c *Client) DeleteIndex() error {
+	if c.client == nil {
+		return nil
+	}
+	_, err := c.client.Indices.Delete([]string{c.index})
+	return err
+}
+
+// DeleteIndex deletes the products index
+func (c *Client) DeleteIndex() error {
+	if c.client == nil {
+		return nil
+	}
+	_, err := c.client.Indices.Delete([]string{c.index})
+	return err
+}
