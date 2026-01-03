@@ -399,18 +399,17 @@ type esBucketAgg struct {
 
 // DeleteIndex deletes the products index
 func (c *Client) DeleteIndex() error {
-	if c.client == nil {
+	if c.httpClient == nil {
 		return nil
 	}
-	_, err := c.client.Indices.Delete([]string{c.index})
-	return err
-}
-
-// DeleteIndex deletes the products index
-func (c *Client) DeleteIndex() error {
-	if c.client == nil {
-		return nil
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/%s", c.baseURL, c.index), nil)
+	if err != nil {
+		return err
 	}
-	_, err := c.client.Indices.Delete([]string{c.index})
-	return err
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
 }
