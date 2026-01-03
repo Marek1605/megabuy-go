@@ -200,7 +200,7 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "URL required"})
 	}
 
-	data, err := downloadFeedData(input.URL, 500*1024) // 500KB for preview
+	data, err := downloadFeedData(input.URL, 1024*1024) // 1MB for preview
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Cannot download feed: " + err.Error()})
 	}
@@ -300,7 +300,6 @@ func downloadFeedData(url string, maxBytes int) ([]byte, error) {
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -607,16 +606,16 @@ func (h *Handlers) syncFeedProductsToES(ctx context.Context, feedID string) {
 
 func mapFields(item map[string]interface{}, mapping map[string]string) map[string]interface{} {
 	result := make(map[string]interface{})
-	
+
 	// First apply explicit mappings
 	for sourceField, targetField := range mapping {
-		if targetField != "" && targetField != "--" {
+		if targetField != "" && targetField != "--" && targetField != "-- Ignorovat --" {
 			if val, ok := item[sourceField]; ok && val != nil && val != "" {
 				result[targetField] = val
 			}
 		}
 	}
-	
+
 	// Auto-mapping for common Heureka/XML fields
 	autoMap := map[string][]string{
 		"title":         {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE", "title", "name", "product_name"},
@@ -629,7 +628,7 @@ func mapFields(item map[string]interface{}, mapping map[string]string) map[strin
 		"affiliate_url": {"URL", "ITEM_URL", "PRODUCT_URL", "url", "product_url", "link"},
 		"category":      {"CATEGORYTEXT", "CATEGORY", "KATEGORIA", "category", "kategorie", "category_text"},
 	}
-	
+
 	for target, sources := range autoMap {
 		if result[target] == nil || result[target] == "" {
 			for _, src := range sources {
@@ -640,7 +639,7 @@ func mapFields(item map[string]interface{}, mapping map[string]string) map[strin
 			}
 		}
 	}
-	
+
 	return result
 }
 
@@ -678,7 +677,7 @@ func getFloat(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
-// XML Parsing - simple string-based approach (no regex backreference)
+// XML Parsing using regex - handles single-line XML properly
 func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 	if itemPath == "" {
 		itemPath = "SHOPITEM"
@@ -687,98 +686,81 @@ func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 	var items []map[string]interface{}
 	content := string(data)
 
-	startTag := "<" + itemPath
-	endTag := "</" + itemPath + ">"
+	// Use regex to find all SHOPITEM blocks
+	pattern := fmt.Sprintf(`(?s)<%s[^>]*>(.*?)</%s>`, itemPath, itemPath)
+	re := regexp.MustCompile(pattern)
+	matches := re.FindAllStringSubmatch(content, -1)
 
-	for {
-		startIdx := strings.Index(content, startTag)
-		if startIdx == -1 {
-			break
+	for _, match := range matches {
+		if len(match) > 1 {
+			item := parseXMLItemRegex(match[1])
+			if len(item) > 0 {
+				items = append(items, item)
+			}
 		}
-
-		// Find the closing > of start tag
-		tagEnd := strings.Index(content[startIdx:], ">")
-		if tagEnd == -1 {
-			break
-		}
-
-		endIdx := strings.Index(content[startIdx:], endTag)
-		if endIdx == -1 {
-			break
-		}
-		endIdx += startIdx + len(endTag)
-
-		itemXML := content[startIdx:endIdx]
-		item := parseXMLItem(itemXML)
-		if len(item) > 0 {
-			items = append(items, item)
-		}
-
-		content = content[endIdx:]
 	}
 
 	return items
 }
 
-func parseXMLItem(xmlStr string) map[string]interface{} {
+func parseXMLItemRegex(xmlStr string) map[string]interface{} {
 	result := make(map[string]interface{})
 
-	// List of tags to extract
+	// Tags to extract from Heureka XML
 	tags := []string{
 		"PRODUCTNAME", "PRODUCT", "DESCRIPTION", "PRICE_VAT", "PRICE",
 		"EAN", "ITEM_ID", "SKU", "MANUFACTURER", "BRAND",
 		"IMGURL", "URL", "CATEGORYTEXT", "CATEGORY",
 		"DELIVERY_DATE", "ITEM_TYPE", "PRODUCT_ID", "NAME",
-		"IMG_URL", "IMAGE", "GTIN", "BARCODE",
 	}
 
 	for _, tag := range tags {
-		value := extractTagValue(xmlStr, tag)
-		if value != "" {
-			result[tag] = value
+		// Pattern handles both regular content and CDATA
+		// Match <TAG>content</TAG> or <TAG><![CDATA[content]]></TAG>
+		pattern := fmt.Sprintf(`<%s[^>]*>(?:<!\[CDATA\[)?([^<]*(?:<![^C]|<[^!]|<$)*)(?:\]\]>)?</%s>`, tag, tag)
+		re := regexp.MustCompile(pattern)
+		match := re.FindStringSubmatch(xmlStr)
+
+		if len(match) > 1 {
+			value := strings.TrimSpace(match[1])
+			// Clean up any remaining CDATA markers
+			value = strings.TrimPrefix(value, "<![CDATA[")
+			value = strings.TrimSuffix(value, "]]>")
+			value = strings.TrimSpace(value)
+			if value != "" {
+				result[tag] = value
+			}
+		} else {
+			// Simpler fallback pattern
+			pattern2 := fmt.Sprintf(`<%s>([^<]+)</%s>`, tag, tag)
+			re2 := regexp.MustCompile(pattern2)
+			match2 := re2.FindStringSubmatch(xmlStr)
+			if len(match2) > 1 {
+				value := strings.TrimSpace(match2[1])
+				if value != "" {
+					result[tag] = value
+				}
+			}
+		}
+	}
+
+	// Special handling for CDATA fields
+	cdataTags := []string{"PRODUCTNAME", "PRODUCT", "DESCRIPTION", "CATEGORYTEXT", "MANUFACTURER"}
+	for _, tag := range cdataTags {
+		if result[tag] == nil {
+			pattern := fmt.Sprintf(`<%s[^>]*><!\[CDATA\[(.*?)\]\]></%s>`, tag, tag)
+			re := regexp.MustCompile(pattern)
+			match := re.FindStringSubmatch(xmlStr)
+			if len(match) > 1 {
+				value := strings.TrimSpace(match[1])
+				if value != "" {
+					result[tag] = value
+				}
+			}
 		}
 	}
 
 	return result
-}
-
-func extractTagValue(xml string, tag string) string {
-	// Try <TAG>value</TAG>
-	startTag := "<" + tag + ">"
-	endTag := "</" + tag + ">"
-
-	startIdx := strings.Index(xml, startTag)
-	if startIdx == -1 {
-		// Try <TAG attr="...">value</TAG>
-		startTagAttr := "<" + tag + " "
-		startIdx = strings.Index(xml, startTagAttr)
-		if startIdx == -1 {
-			return ""
-		}
-		// Find closing >
-		closeIdx := strings.Index(xml[startIdx:], ">")
-		if closeIdx == -1 {
-			return ""
-		}
-		startIdx = startIdx + closeIdx + 1
-	} else {
-		startIdx = startIdx + len(startTag)
-	}
-
-	endIdx := strings.Index(xml[startIdx:], endTag)
-	if endIdx == -1 {
-		return ""
-	}
-
-	value := xml[startIdx : startIdx+endIdx]
-
-	// Handle CDATA
-	if strings.HasPrefix(value, "<![CDATA[") {
-		value = strings.TrimPrefix(value, "<![CDATA[")
-		value = strings.TrimSuffix(value, "]]>")
-	}
-
-	return strings.TrimSpace(value)
 }
 
 func parseXMLPreview(data []byte, itemPath string) FeedPreview {
@@ -787,7 +769,7 @@ func parseXMLPreview(data []byte, itemPath string) FeedPreview {
 	if len(items) > 5 {
 		items = items[:5]
 	}
-	
+
 	// Collect all unique fields from all sample items
 	fieldsMap := make(map[string]bool)
 	for _, item := range items {
@@ -795,12 +777,20 @@ func parseXMLPreview(data []byte, itemPath string) FeedPreview {
 			fieldsMap[k] = true
 		}
 	}
-	
+
 	fields := make([]string, 0, len(fieldsMap))
 	for k := range fieldsMap {
 		fields = append(fields, k)
 	}
-	
+
+	// Ensure we return empty slice, not nil
+	if items == nil {
+		items = []map[string]interface{}{}
+	}
+	if fields == nil {
+		fields = []string{}
+	}
+
 	return FeedPreview{Fields: fields, Sample: items, TotalItems: totalItems}
 }
 
@@ -816,6 +806,9 @@ func parseJSONPreview(data []byte) FeedPreview {
 			fields = append(fields, k)
 		}
 	}
+	if items == nil {
+		items = []map[string]interface{}{}
+	}
 	return FeedPreview{Fields: fields, Sample: items, TotalItems: totalItems}
 }
 
@@ -830,6 +823,9 @@ func parseCSVPreview(data []byte) FeedPreview {
 		for k := range items[0] {
 			fields = append(fields, k)
 		}
+	}
+	if items == nil {
+		items = []map[string]interface{}{}
 	}
 	return FeedPreview{Fields: fields, Sample: items, TotalItems: totalItems}
 }
@@ -864,12 +860,12 @@ func parseFullJSON(data []byte) []map[string]interface{} {
 
 func parseFullCSV(data []byte) []map[string]interface{} {
 	var items []map[string]interface{}
-	
+
 	lines := strings.Split(string(data), "\n")
 	if len(lines) == 0 {
 		return items
 	}
-	
+
 	firstLine := lines[0]
 	delimiter := ';'
 	if strings.Count(firstLine, ",") > strings.Count(firstLine, ";") {
@@ -878,17 +874,17 @@ func parseFullCSV(data []byte) []map[string]interface{} {
 	if strings.Count(firstLine, "\t") > strings.Count(firstLine, string(delimiter)) {
 		delimiter = '\t'
 	}
-	
+
 	reader := csv.NewReader(bytes.NewReader(data))
 	reader.Comma = delimiter
 	reader.LazyQuotes = true
-	reader.FieldsPerRecord = -1 // Allow variable number of fields
-	
+	reader.FieldsPerRecord = -1
+
 	header, err := reader.Read()
 	if err != nil {
 		return items
 	}
-	
+
 	for {
 		row, err := reader.Read()
 		if err != nil {
