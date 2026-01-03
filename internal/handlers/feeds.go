@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
