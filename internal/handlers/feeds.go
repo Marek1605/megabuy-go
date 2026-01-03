@@ -1,4 +1,3 @@
-cat > internal/handlers/feeds.go << 'GOEOF'
 package handlers
 
 import (
