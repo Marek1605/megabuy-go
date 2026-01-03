@@ -49,18 +49,23 @@ func main() {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
+	// API v1 routes
 	api := app.Group("/api/v1")
 
+	// Public routes
 	api.Get("/search", h.Search)
 	api.Get("/products", h.GetProducts)
 	api.Get("/products/featured", h.GetFeaturedProducts)
 	api.Get("/products/:slug", h.GetProductBySlug)
+	api.Get("/products/:id/offers", h.GetProductOffers)
 	api.Get("/categories", h.GetCategories)
+	api.Get("/categories/tree", h.GetCategories)
+	api.Get("/categories/flat", h.GetCategories)
 	api.Get("/categories/:slug", h.GetCategoryBySlug)
 	api.Get("/categories/:slug/products", h.GetProductsByCategory)
 	api.Get("/stats", h.GetStats)
-	api.Get("/products/:id/offers", h.GetProductOffers)
 
+	// Admin routes
 	admin := api.Group("/admin")
 	admin.Get("/dashboard", h.AdminDashboard)
 	admin.Post("/sync-elasticsearch", h.SyncToElasticsearch)
@@ -82,12 +87,19 @@ func main() {
 	admin.Post("/feeds/:id/import", h.StartImport)
 	admin.Get("/feeds/:id/progress", h.GetImportProgress)
 
+	// Legacy routes without /api/v1 prefix (frontend compatibility)
+	app.Get("/products", h.GetProducts)
+	app.Get("/categories", h.GetCategories)
+	app.Get("/categories/tree", h.GetCategories)
+	app.Get("/categories/flat", h.GetCategories)
+	app.Get("/admin/products", h.AdminProducts)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	fmt.Printf("🚀 MegaBuy API starting on port %s\n", port)
-	fmt.Printf("📊 Elasticsearch: %s\n", os.Getenv("ELASTICSEARCH_URL"))
+	fmt.Printf("?? MegaBuy API starting on port %s\n", port)
+	fmt.Printf("?? Elasticsearch: %s\n", os.Getenv("ELASTICSEARCH_URL"))
 	log.Fatal(app.Listen(":" + port))
 }
