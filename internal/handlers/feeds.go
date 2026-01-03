@@ -1,24 +1,29 @@
+cat > internal/handlers/feeds.go << 'GOEOF'
 package handlers
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	
+
 	"megabuy-go/internal/elasticsearch"
 )
 
-// Feed structure
 type Feed struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
@@ -197,18 +202,10 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "URL required"})
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, _ := http.NewRequest("GET", input.URL, nil)
-	req.Header.Set("User-Agent", "MegaBuy Feed Parser/1.0")
-	req.Header.Set("Range", "bytes=0-204800")
-
-	resp, err := client.Do(req)
+	data, err := downloadFeedData(input.URL, 200*1024)
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Cannot download feed: " + err.Error()})
 	}
-	defer resp.Body.Close()
-
-	data, _ := io.ReadAll(resp.Body)
 
 	detectedType := input.Type
 	if detectedType == "" {
@@ -236,143 +233,6 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"success": true, "data": preview})
 }
 
-func parseXMLPreview(data []byte, itemPath string) FeedPreview {
-	preview := FeedPreview{Fields: []string{}, Sample: []map[string]interface{}{}}
-	if itemPath == "" {
-		itemPath = "SHOPITEM"
-	}
-
-	decoder := xml.NewDecoder(bytes.NewReader(data))
-	var currentItem map[string]interface{}
-	var currentElement string
-	var inItem bool
-	fieldsMap := make(map[string]bool)
-
-	for {
-		token, err := decoder.Token()
-		if err != nil {
-			break
-		}
-		switch t := token.(type) {
-		case xml.StartElement:
-			if strings.EqualFold(t.Name.Local, itemPath) {
-				inItem = true
-				currentItem = make(map[string]interface{})
-			} else if inItem {
-				currentElement = t.Name.Local
-			}
-		case xml.CharData:
-			if inItem && currentElement != "" {
-				value := strings.TrimSpace(string(t))
-				if value != "" {
-					currentItem[currentElement] = value
-					fieldsMap[currentElement] = true
-				}
-			}
-		case xml.EndElement:
-			if strings.EqualFold(t.Name.Local, itemPath) {
-				inItem = false
-				if len(currentItem) > 0 {
-					preview.Sample = append(preview.Sample, currentItem)
-					preview.TotalItems++
-					if len(preview.Sample) >= 5 {
-						for field := range fieldsMap {
-							preview.Fields = append(preview.Fields, field)
-						}
-						return preview
-					}
-				}
-				currentItem = nil
-			}
-			currentElement = ""
-		}
-	}
-	for field := range fieldsMap {
-		preview.Fields = append(preview.Fields, field)
-	}
-	return preview
-}
-
-func parseJSONPreview(data []byte) FeedPreview {
-	preview := FeedPreview{Fields: []string{}, Sample: []map[string]interface{}{}}
-	var jsonData interface{}
-	if err := json.Unmarshal(data, &jsonData); err != nil {
-		return preview
-	}
-
-	var items []map[string]interface{}
-	switch v := jsonData.(type) {
-	case []interface{}:
-		for _, item := range v {
-			if m, ok := item.(map[string]interface{}); ok {
-				items = append(items, m)
-			}
-		}
-	case map[string]interface{}:
-		for _, key := range []string{"products", "items", "data", "results", "offers"} {
-			if arr, ok := v[key].([]interface{}); ok {
-				for _, item := range arr {
-					if m, ok := item.(map[string]interface{}); ok {
-						items = append(items, m)
-					}
-				}
-				break
-			}
-		}
-	}
-
-	fieldsMap := make(map[string]bool)
-	for i, item := range items {
-		if i >= 5 {
-			break
-		}
-		preview.Sample = append(preview.Sample, item)
-		for key := range item {
-			fieldsMap[key] = true
-		}
-	}
-	for field := range fieldsMap {
-		preview.Fields = append(preview.Fields, field)
-	}
-	preview.TotalItems = len(items)
-	return preview
-}
-
-func parseCSVPreview(data []byte) FeedPreview {
-	preview := FeedPreview{Fields: []string{}, Sample: []map[string]interface{}{}}
-	firstLine := strings.Split(string(data), "\n")[0]
-	delimiter := ';'
-	if strings.Count(firstLine, ",") > strings.Count(firstLine, ";") {
-		delimiter = ','
-	}
-
-	reader := csv.NewReader(bytes.NewReader(data))
-	reader.Comma = delimiter
-	reader.LazyQuotes = true
-
-	header, err := reader.Read()
-	if err != nil {
-		return preview
-	}
-	preview.Fields = header
-
-	for i := 0; i < 5; i++ {
-		row, err := reader.Read()
-		if err != nil {
-			break
-		}
-		item := make(map[string]interface{})
-		for j, val := range row {
-			if j < len(header) {
-				item[header[j]] = val
-			}
-		}
-		preview.Sample = append(preview.Sample, item)
-		preview.TotalItems++
-	}
-	return preview
-}
-
 func (h *Handlers) StartImport(c *fiber.Ctx) error {
 	feedID := c.Params("id")
 	ctx := context.Background()
@@ -388,7 +248,6 @@ func (h *Handlers) StartImport(c *fiber.Ctx) error {
 	}
 	json.Unmarshal([]byte(fieldMappingStr), &feed.FieldMapping)
 
-	// Init progress
 	progressMutex.Lock()
 	importProgress[feedID] = &ImportProgress{
 		FeedID:  feedID,
@@ -398,129 +257,199 @@ func (h *Handlers) StartImport(c *fiber.Ctx) error {
 	}
 	progressMutex.Unlock()
 
-	// Update feed status
 	h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='running', last_run=NOW() WHERE id=$1::uuid", feedID)
 
-	// Run import in background
 	go h.runImport(feed)
 
 	return c.JSON(fiber.Map{"success": true, "message": "Import started"})
+}
+
+func downloadFeedData(url string, maxBytes int) ([]byte, error) {
+	// Support local files
+	if strings.HasPrefix(url, "/") {
+		data, err := os.ReadFile(url)
+		if err != nil {
+			return nil, err
+		}
+		if maxBytes > 0 && len(data) > maxBytes {
+			return data[:maxBytes], nil
+		}
+		return data, nil
+	}
+
+	// HTTP download with robust settings
+	tr := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		DisableCompression:    false,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
+	client := &http.Client{
+		Timeout:   15 * time.Minute,
+		Transport: tr,
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MegaBuy/1.0)")
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	if maxBytes > 0 {
+		data := make([]byte, maxBytes)
+		n, _ := io.ReadFull(resp.Body, data)
+		return data[:n], nil
+	}
+
+	return io.ReadAll(resp.Body)
 }
 
 func (h *Handlers) runImport(feed Feed) {
 	ctx := context.Background()
 	feedID := feed.ID
 
-	updateProgress := func(status, message string) {
+	addLog := func(msg string) {
+		progressMutex.Lock()
+		if p, ok := importProgress[feedID]; ok {
+			p.Logs = append(p.Logs, msg)
+		}
+		progressMutex.Unlock()
+	}
+
+	updateStatus := func(status, message string) {
 		progressMutex.Lock()
 		if p, ok := importProgress[feedID]; ok {
 			p.Status = status
 			p.Message = message
-			p.Logs = append(p.Logs, message)
-			if p.Total > 0 {
-				p.Percent = (p.Processed * 100) / p.Total
-			}
 		}
 		progressMutex.Unlock()
 	}
 
 	// Download feed
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(feed.URL)
+	addLog("Downloading from: " + feed.URL)
+	data, err := downloadFeedData(feed.URL, 0)
 	if err != nil {
-		updateProgress("failed", "Download failed: "+err.Error())
+		addLog("Download failed: " + err.Error())
+		updateStatus("failed", "Download failed: "+err.Error())
 		h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='failed' WHERE id=$1::uuid", feedID)
 		return
 	}
-	defer resp.Body.Close()
+	addLog(fmt.Sprintf("Downloaded %d KB", len(data)/1024))
 
-	data, _ := io.ReadAll(resp.Body)
-	updateProgress("parsing", "Parsujem feed...")
+	updateStatus("parsing", "Parsujem feed...")
 
 	// Parse feed
 	var items []map[string]interface{}
 	switch feed.Type {
 	case "xml":
-		items = parseFullXML(data, feed.XMLItemPath)
+		items = parseFullXMLRegex(data, feed.XMLItemPath)
 	case "json":
 		items = parseFullJSON(data)
 	case "csv":
 		items = parseFullCSV(data)
 	}
 
+	addLog(fmt.Sprintf("Parsed %d items", len(items)))
+
+	if len(items) == 0 {
+		addLog("No items found in feed")
+		updateStatus("failed", "Feed neobsahuje produkty")
+		h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='failed' WHERE id=$1::uuid", feedID)
+		return
+	}
+
 	progressMutex.Lock()
 	importProgress[feedID].Total = len(items)
 	progressMutex.Unlock()
 
-	updateProgress("importing", "Importujem "+string(rune(len(items)))+" produktov...")
+	updateStatus("importing", fmt.Sprintf("Importujem %d produktov...", len(items)))
 
-	// Import products
+	created, updated, skipped, errors := 0, 0, 0, 0
+
 	for i, item := range items {
 		productData := mapFields(item, feed.FieldMapping)
-		
-		if productData["title"] == "" {
-			progressMutex.Lock()
-			importProgress[feedID].Skipped++
-			importProgress[feedID].Processed++
-			progressMutex.Unlock()
+
+		title := getStr(productData, "title")
+		if title == "" {
+			skipped++
 			continue
 		}
 
-		// Check if exists by EAN or SKU
+		price := getFloat(productData, "price")
+		if price <= 0 {
+			skipped++
+			continue
+		}
+
+		// Check existing by EAN or SKU
 		var existingID string
-		if ean, ok := productData["ean"].(string); ok && ean != "" {
+		ean := getStr(productData, "ean")
+		sku := getStr(productData, "sku")
+
+		if ean != "" {
 			h.db.Pool.QueryRow(ctx, "SELECT id FROM products WHERE ean=$1", ean).Scan(&existingID)
 		}
-		if existingID == "" {
-			if sku, ok := productData["sku"].(string); ok && sku != "" {
-				h.db.Pool.QueryRow(ctx, "SELECT id FROM products WHERE sku=$1", sku).Scan(&existingID)
-			}
+		if existingID == "" && sku != "" {
+			h.db.Pool.QueryRow(ctx, "SELECT id FROM products WHERE sku=$1", sku).Scan(&existingID)
 		}
 
 		if existingID != "" {
-			// Update existing
-			h.updateProductFromFeed(ctx, existingID, productData)
-			progressMutex.Lock()
-			importProgress[feedID].Updated++
-			progressMutex.Unlock()
+			err := h.updateProductFromFeed(ctx, existingID, productData)
+			if err == nil {
+				updated++
+			} else {
+				errors++
+			}
 		} else {
-			// Create new
 			newID := h.createProductFromFeed(ctx, productData, feedID)
 			if newID != "" {
-				progressMutex.Lock()
-				importProgress[feedID].Created++
-				progressMutex.Unlock()
+				created++
 			} else {
-				progressMutex.Lock()
-				importProgress[feedID].Errors++
-				progressMutex.Unlock()
+				errors++
 			}
 		}
 
-		progressMutex.Lock()
-		importProgress[feedID].Processed++
-		importProgress[feedID].Percent = ((i + 1) * 100) / len(items)
-		progressMutex.Unlock()
-
-		// Log every 100 items
-		if (i+1)%100 == 0 {
-			updateProgress("importing", "Spracované: "+string(rune(i+1))+"/"+string(rune(len(items))))
+		// Update progress every 50 items
+		if (i+1)%50 == 0 || i == len(items)-1 {
+			progressMutex.Lock()
+			if p, ok := importProgress[feedID]; ok {
+				p.Processed = i + 1
+				p.Created = created
+				p.Updated = updated
+				p.Skipped = skipped
+				p.Errors = errors
+				p.Percent = ((i + 1) * 100) / len(items)
+				p.Message = fmt.Sprintf("Spracované %d/%d", i+1, len(items))
+			}
+			progressMutex.Unlock()
 		}
 	}
 
 	// Complete
+	addLog(fmt.Sprintf("Completed: %d created, %d updated, %d skipped, %d errors", created, updated, skipped, errors))
+	updateStatus("completed", fmt.Sprintf("Hotovo: %d vytvorených, %d aktualizovaných", created, updated))
+
 	progressMutex.Lock()
-	p := importProgress[feedID]
-	p.Status = "completed"
-	p.Message = "Import dokončený"
-	p.Percent = 100
-	p.Logs = append(p.Logs, "Completed: "+string(rune(p.Created))+" created, "+string(rune(p.Updated))+" updated")
+	if p, ok := importProgress[feedID]; ok {
+		p.Percent = 100
+		p.Processed = len(items)
+	}
 	progressMutex.Unlock()
 
-	// Update feed stats
-	h.db.Pool.Exec(ctx, `
-		UPDATE feeds SET last_status='completed', product_count=$2 WHERE id=$1::uuid
-	`, feedID, p.Created+p.Updated)
+	h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='completed', product_count=$2 WHERE id=$1::uuid", feedID, created+updated)
 
 	// Sync to Elasticsearch
 	h.syncFeedProductsToES(ctx, feedID)
@@ -528,52 +457,96 @@ func (h *Handlers) runImport(feed Feed) {
 
 func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]interface{}, feedID string) string {
 	productID := uuid.New()
-	title, _ := data["title"].(string)
+	title := getStr(data, "title")
 	slug := makeSlug(title)
-	description, _ := data["description"].(string)
-	shortDesc, _ := data["short_description"].(string)
-	ean, _ := data["ean"].(string)
-	sku, _ := data["sku"].(string)
-	brand, _ := data["brand"].(string)
-	imageURL, _ := data["image_url"].(string)
-	affiliateURL, _ := data["affiliate_url"].(string)
-	
-	var priceMin float64
-	switch v := data["price"].(type) {
-	case float64:
-		priceMin = v
-	case string:
-		// Parse string to float
+	description := getStr(data, "description")
+	shortDesc := getStr(data, "short_description")
+	ean := getStr(data, "ean")
+	sku := getStr(data, "sku")
+	brand := getStr(data, "brand")
+	imageURL := getStr(data, "image_url")
+	affiliateURL := getStr(data, "affiliate_url")
+	category := getStr(data, "category")
+	price := getFloat(data, "price")
+
+	// Find or create category
+	var categoryID *string
+	if category != "" {
+		catID := h.findOrCreateCategory(ctx, category)
+		if catID != "" {
+			categoryID = &catID
+		}
 	}
 
 	_, err := h.db.Pool.Exec(ctx, `
 		INSERT INTO products (id, title, slug, description, short_description, ean, sku, brand, 
-		                      image_url, affiliate_url, price_min, price_max, is_active, feed_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, true, $12::uuid, NOW(), NOW())
-	`, productID, title, slug, description, shortDesc, ean, sku, brand, imageURL, affiliateURL, priceMin, feedID)
-	
+		                      image_url, affiliate_url, category_id, price_min, price_max, stock_status, is_active, feed_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, 'instock', true, $13::uuid, NOW(), NOW())
+	`, productID, title, slug, description, shortDesc, ean, sku, brand, imageURL, affiliateURL, categoryID, price, feedID)
+
 	if err != nil {
 		return ""
 	}
+
+	// Update category count
+	if categoryID != nil {
+		h.db.Pool.Exec(ctx, "UPDATE categories SET product_count = product_count + 1 WHERE id = $1::uuid", *categoryID)
+	}
+
 	return productID.String()
 }
 
-func (h *Handlers) updateProductFromFeed(ctx context.Context, productID string, data map[string]interface{}) {
-	title, _ := data["title"].(string)
-	description, _ := data["description"].(string)
-	imageURL, _ := data["image_url"].(string)
-	
-	var priceMin float64
-	switch v := data["price"].(type) {
-	case float64:
-		priceMin = v
-	}
+func (h *Handlers) updateProductFromFeed(ctx context.Context, productID string, data map[string]interface{}) error {
+	title := getStr(data, "title")
+	description := getStr(data, "description")
+	imageURL := getStr(data, "image_url")
+	price := getFloat(data, "price")
 
-	h.db.Pool.Exec(ctx, `
+	_, err := h.db.Pool.Exec(ctx, `
 		UPDATE products SET title=COALESCE(NULLIF($2,''),title), description=COALESCE(NULLIF($3,''),description),
 		       image_url=COALESCE(NULLIF($4,''),image_url), price_min=$5, price_max=$5, updated_at=NOW()
 		WHERE id=$1::uuid
-	`, productID, title, description, imageURL, priceMin)
+	`, productID, title, description, imageURL, price)
+	return err
+}
+
+func (h *Handlers) findOrCreateCategory(ctx context.Context, categoryText string) string {
+	parts := strings.Split(categoryText, "|")
+	if len(parts) == 1 {
+		parts = strings.Split(categoryText, ">")
+	}
+
+	var parentID *string
+	var lastID string
+
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		slug := makeSlug(name)
+
+		var catID string
+		if parentID != nil {
+			h.db.Pool.QueryRow(ctx, "SELECT id FROM categories WHERE slug = $1 AND parent_id = $2::uuid", slug, *parentID).Scan(&catID)
+		} else {
+			h.db.Pool.QueryRow(ctx, "SELECT id FROM categories WHERE slug = $1 AND parent_id IS NULL", slug).Scan(&catID)
+		}
+
+		if catID == "" {
+			catID = uuid.New().String()
+			if parentID != nil {
+				h.db.Pool.Exec(ctx, "INSERT INTO categories (id, parent_id, name, slug, is_active, created_at, updated_at) VALUES ($1::uuid, $2::uuid, $3, $4, true, NOW(), NOW())", catID, *parentID, name, slug)
+			} else {
+				h.db.Pool.Exec(ctx, "INSERT INTO categories (id, name, slug, is_active, created_at, updated_at) VALUES ($1::uuid, $2, $3, true, NOW(), NOW())", catID, name, slug)
+			}
+		}
+
+		lastID = catID
+		parentID = &catID
+	}
+
+	return lastID
 }
 
 func (h *Handlers) syncFeedProductsToES(ctx context.Context, feedID string) {
@@ -617,21 +590,21 @@ func mapFields(item map[string]interface{}, mapping map[string]string) map[strin
 			}
 		}
 	}
-	// Also try auto-mapping common fields
 	autoMap := map[string][]string{
-		"title":       {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE"},
-		"description": {"DESCRIPTION", "POPIS", "DESC"},
-		"price":       {"PRICE_VAT", "PRICE", "CENA"},
-		"ean":         {"EAN", "EAN13", "GTIN", "BARCODE"},
-		"sku":         {"SKU", "ITEM_ID", "PRODUCTNO", "KOD"},
-		"brand":       {"MANUFACTURER", "BRAND", "VYROBCE", "ZNACKA"},
-		"image_url":   {"IMGURL", "IMG_URL", "IMAGE", "OBRAZOK"},
-		"affiliate_url": {"URL", "ITEM_URL", "PRODUCT_URL"},
+		"title":        {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE", "title", "name"},
+		"description":  {"DESCRIPTION", "POPIS", "DESC", "description"},
+		"price":        {"PRICE_VAT", "PRICE", "CENA", "price", "price_vat"},
+		"ean":          {"EAN", "EAN13", "GTIN", "BARCODE", "ean"},
+		"sku":          {"SKU", "ITEM_ID", "PRODUCTNO", "KOD", "sku", "item_id"},
+		"brand":        {"MANUFACTURER", "BRAND", "VYROBCE", "ZNACKA", "brand", "manufacturer"},
+		"image_url":    {"IMGURL", "IMG_URL", "IMAGE", "OBRAZOK", "image_url", "imgurl"},
+		"affiliate_url": {"URL", "ITEM_URL", "PRODUCT_URL", "url"},
+		"category":     {"CATEGORYTEXT", "CATEGORY", "KATEGORIA", "category"},
 	}
 	for target, sources := range autoMap {
-		if result[target] == nil {
+		if result[target] == nil || result[target] == "" {
 			for _, src := range sources {
-				if val, ok := item[src]; ok && val != "" {
+				if val, ok := item[src]; ok && val != nil && val != "" {
 					result[target] = val
 					break
 				}
@@ -641,49 +614,113 @@ func mapFields(item map[string]interface{}, mapping map[string]string) map[strin
 	return result
 }
 
-func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
-	var items []map[string]interface{}
+func getStr(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		switch s := v.(type) {
+		case string:
+			return strings.TrimSpace(s)
+		default:
+			return fmt.Sprintf("%v", v)
+		}
+	}
+	return ""
+}
+
+func getFloat(m map[string]interface{}, key string) float64 {
+	if v, ok := m[key]; ok {
+		switch f := v.(type) {
+		case float64:
+			return f
+		case string:
+			s := strings.ReplaceAll(f, ",", ".")
+			s = regexp.MustCompile(`[^\d.]`).ReplaceAllString(s, "")
+			if val, err := strconv.ParseFloat(s, 64); err == nil {
+				return val
+			}
+		}
+	}
+	return 0
+}
+
+func parseFullXMLRegex(data []byte, itemPath string) []map[string]interface{} {
 	if itemPath == "" {
 		itemPath = "SHOPITEM"
 	}
 
-	decoder := xml.NewDecoder(bytes.NewReader(data))
-	var currentItem map[string]interface{}
-	var currentElement string
-	var inItem bool
+	var items []map[string]interface{}
+	pattern := fmt.Sprintf(`(?s)<%s[^>]*>(.*?)</%s>`, itemPath, itemPath)
+	re := regexp.MustCompile(pattern)
+	matches := re.FindAllSubmatch(data, -1)
 
-	for {
-		token, err := decoder.Token()
-		if err != nil {
-			break
-		}
-		switch t := token.(type) {
-		case xml.StartElement:
-			if strings.EqualFold(t.Name.Local, itemPath) {
-				inItem = true
-				currentItem = make(map[string]interface{})
-			} else if inItem {
-				currentElement = t.Name.Local
+	for _, match := range matches {
+		if len(match) > 1 {
+			item := parseXMLItem(match[1])
+			if len(item) > 0 {
+				items = append(items, item)
 			}
-		case xml.CharData:
-			if inItem && currentElement != "" {
-				value := strings.TrimSpace(string(t))
-				if value != "" {
-					currentItem[currentElement] = value
-				}
-			}
-		case xml.EndElement:
-			if strings.EqualFold(t.Name.Local, itemPath) {
-				inItem = false
-				if len(currentItem) > 0 {
-					items = append(items, currentItem)
-				}
-				currentItem = nil
-			}
-			currentElement = ""
 		}
 	}
 	return items
+}
+
+func parseXMLItem(data []byte) map[string]interface{} {
+	result := make(map[string]interface{})
+	tagPattern := regexp.MustCompile(`(?s)<([A-Za-z_][A-Za-z0-9_]*)(?:\s[^>]*)?>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\1>`)
+	matches := tagPattern.FindAllSubmatch(data, -1)
+
+	for _, match := range matches {
+		if len(match) > 2 {
+			key := string(match[1])
+			value := strings.TrimSpace(string(match[2]))
+			if value == "" || key == "DELIVERY" || key == "PARAM" {
+				continue
+			}
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func parseXMLPreview(data []byte, itemPath string) FeedPreview {
+	items := parseFullXMLRegex(data, itemPath)
+	if len(items) > 5 {
+		items = items[:5]
+	}
+	fields := []string{}
+	if len(items) > 0 {
+		for k := range items[0] {
+			fields = append(fields, k)
+		}
+	}
+	return FeedPreview{Fields: fields, Sample: items, TotalItems: len(items)}
+}
+
+func parseJSONPreview(data []byte) FeedPreview {
+	items := parseFullJSON(data)
+	if len(items) > 5 {
+		items = items[:5]
+	}
+	fields := []string{}
+	if len(items) > 0 {
+		for k := range items[0] {
+			fields = append(fields, k)
+		}
+	}
+	return FeedPreview{Fields: fields, Sample: items, TotalItems: len(items)}
+}
+
+func parseCSVPreview(data []byte) FeedPreview {
+	items := parseFullCSV(data)
+	if len(items) > 5 {
+		items = items[:5]
+	}
+	fields := []string{}
+	if len(items) > 0 {
+		for k := range items[0] {
+			fields = append(fields, k)
+		}
+	}
+	return FeedPreview{Fields: fields, Sample: items, TotalItems: len(items)}
 }
 
 func parseFullJSON(data []byte) []map[string]interface{} {
@@ -692,7 +729,6 @@ func parseFullJSON(data []byte) []map[string]interface{} {
 	if err := json.Unmarshal(data, &jsonData); err != nil {
 		return items
 	}
-
 	switch v := jsonData.(type) {
 	case []interface{}:
 		for _, item := range v {
@@ -722,16 +758,13 @@ func parseFullCSV(data []byte) []map[string]interface{} {
 	if strings.Count(firstLine, ",") > strings.Count(firstLine, ";") {
 		delimiter = ','
 	}
-
 	reader := csv.NewReader(bytes.NewReader(data))
 	reader.Comma = delimiter
 	reader.LazyQuotes = true
-
 	header, err := reader.Read()
 	if err != nil {
 		return items
 	}
-
 	for {
 		row, err := reader.Read()
 		if err != nil {
@@ -753,9 +786,9 @@ func (h *Handlers) GetImportProgress(c *fiber.Ctx) error {
 	progressMutex.RLock()
 	progress, ok := importProgress[feedID]
 	progressMutex.RUnlock()
-
 	if !ok {
 		return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"status": "idle"}})
 	}
 	return c.JSON(fiber.Map{"success": true, "data": progress})
 }
+GOEOF
