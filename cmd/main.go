@@ -1,117 +1,107 @@
-async function fetchAPI(endpoint: string, options?: RequestInit) {
-  try {
-    const res = await fetch(`${API_URL}${endpoint}`, {
-      headers: { 'Content-Type': 'application/json', ...options?.headers },
-      ...options,
-    })
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ error: 'Request failed' }))
-      throw new Error(error.error || 'Request failed')
-    }
-    const json = await res.json()
-    if (json.data !== undefined) {
-      return json.data
-    }
-    return json
-  } catch (error) {
-    console.error(`API Error [${endpoint}]:`, error)
-    return null
-  }
-}
+package main
 
-export function formatPrice(price: number | undefined | null): string {
-  if (price === undefined || price === null) return '0,00 €'
-  return new Intl.NumberFormat('sk-SK', { style: 'currency', currency: 'EUR' }).format(price)
-}
+import (
+	"fmt"
+	"log"
+	"os"
 
-export function formatDate(date: string | Date): string {
-  return new Intl.DateTimeFormat('sk-SK', {
-    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
-  }).format(new Date(date))
-}
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/joho/godotenv"
 
-export const api = {
-  async getProducts(params?: { page?: number; limit?: number; search?: string; category?: string; brand?: string; min_price?: number; max_price?: number; sort?: string }) {
-    const query = new URLSearchParams()
-    if (params?.page) query.set('page', String(params.page))
-    if (params?.limit) query.set('limit', String(params.limit))
-    if (params?.search) query.set('search', params.search)
-    if (params?.category) query.set('category', params.category)
-    if (params?.brand) query.set('brand', params.brand)
-    if (params?.min_price) query.set('min_price', String(params.min_price))
-    if (params?.max_price) query.set('max_price', String(params.max_price))
-    if (params?.sort) query.set('sort', params.sort)
-    return fetchAPI(`/products?${query}`)
-  },
-  async getProductBySlug(slug: string) { return fetchAPI(`/products/slug/${slug}`) },
-  async getProductOffers(productId: string) { return fetchAPI(`/products/${productId}/offers`) },
-  async getProductsByCategory(slug: string, params?: { page?: number; limit?: number }) {
-    const query = new URLSearchParams({ category: slug })
-    if (params?.page) query.set('page', String(params.page))
-    if (params?.limit) query.set('limit', String(params.limit))
-    return fetchAPI(`/products?${query}`)
-  },
-  async getFeaturedProducts(limit: number = 8) {
-    const data = await fetchAPI(`/products?limit=${limit}&sort=newest`)
-    return data?.items || data || []
-  },
-  async search(query: string, params?: { page?: number; limit?: number }) {
-    const searchParams = new URLSearchParams({ search: query })
-    if (params?.page) searchParams.set('page', String(params.page))
-    if (params?.limit) searchParams.set('limit', String(params.limit))
-    return fetchAPI(`/search?${searchParams}`)
-  },
-  async getCategories() { return fetchAPI('/categories') },
-  async getCategoryTree() { return fetchAPI('/categories/tree') },
-  async getCategoriesTree() { return fetchAPI('/categories/tree') },
-  async getCategoriesFlat() { return fetchAPI('/categories/flat') },
-  async getCategoryBySlug(slug: string) { return fetchAPI(`/categories/slug/${slug}`) },
-  async getAdminProducts(params?: { page?: number; limit?: number; search?: string; category?: string; status?: string }) {
-    const query = new URLSearchParams()
-    if (params?.page) query.set('page', String(params.page))
-    if (params?.limit) query.set('limit', String(params.limit))
-    if (params?.search) query.set('search', params.search)
-    if (params?.category) query.set('category', params.category)
-    if (params?.status) query.set('status', params.status)
-    return fetchAPI(`/admin/products?${query}`)
-  },
-  async getProduct(id: string) { return fetchAPI(`/admin/products/${id}`) },
-  async createProduct(data: any) { return fetchAPI('/admin/products', { method: 'POST', body: JSON.stringify(data) }) },
-  async updateProduct(id: string, data: any) { return fetchAPI(`/admin/products/${id}`, { method: 'PUT', body: JSON.stringify(data) }) },
-  async deleteProduct(id: string) { return fetchAPI(`/admin/products/${id}`, { method: 'DELETE' }) },
-  async bulkUpdateProducts(ids: string[], action: 'activate' | 'deactivate' | 'delete') {
-    return fetchAPI('/admin/products/bulk', { method: 'POST', body: JSON.stringify({ ids, action }) })
-  },
-  async syncProductsToES() { return fetchAPI('/admin/products/sync-es', { method: 'POST' }) },
-  async getCategory(id: string) { return fetchAPI(`/admin/categories/${id}`) },
-  async createCategory(data: any) { return fetchAPI('/admin/categories', { method: 'POST', body: JSON.stringify(data) }) },
-  async updateCategory(id: string, data: any) { return fetchAPI(`/admin/categories/${id}`, { method: 'PUT', body: JSON.stringify(data) }) },
-  async deleteCategory(id: string) { return fetchAPI(`/admin/categories/${id}`, { method: 'DELETE' }) },
-  async getFeeds() { return fetchAPI('/admin/feeds') },
-  async createFeed(data: any) { return fetchAPI('/admin/feeds', { method: 'POST', body: JSON.stringify(data) }) },
-  async previewFeed(url: string) { return fetchAPI('/admin/feeds/preview', { method: 'POST', body: JSON.stringify({ url }) }) },
-  async updateFeed(id: string, data: any) { return fetchAPI(`/admin/feeds/${id}`, { method: 'PUT', body: JSON.stringify(data) }) },
-  async deleteFeed(id: string) { return fetchAPI(`/admin/feeds/${id}`, { method: 'DELETE' }) },
-  async startFeedImport(id: string) { return fetchAPI(`/admin/feeds/${id}/import`, { method: 'POST' }) },
-  async getFeedProgress(id: string) { return fetchAPI(`/admin/feeds/${id}/progress`) },
-  async uploadImage(file: File) {
-    const formData = new FormData()
-    formData.append('file', file)
-    try {
-      const res = await fetch(`${API_URL}/admin/upload`, { method: 'POST', body: formData })
-      const json = await res.json()
-      return json.data || json
-    } catch (error) { return null }
-  },
-  async uploadMultipleImages(files: File[]) {
-    const formData = new FormData()
-    files.forEach(file => formData.append('files', file))
-    try {
-      const res = await fetch(`${API_URL}/admin/upload/multiple`, { method: 'POST', body: formData })
-      const json = await res.json()
-      return json.data || json
-    } catch (error) { return null }
-  },
-}
+	"megabuy-go/internal/database"
+	"megabuy-go/internal/handlers"
+)
 
-export default api
+func main() {
+	godotenv.Load()
+
+	db, err := database.New()
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	if os.Getenv("RUN_MIGRATIONS") == "true" {
+		if err := db.RunMigrations("./migrations/001_init.sql"); err != nil {
+			log.Printf("Migration warning: %v", err)
+		}
+	}
+
+	h := handlers.New(db)
+
+	app := fiber.New(fiber.Config{
+		AppName:   "MegaBuy API",
+		BodyLimit: 50 * 1024 * 1024,
+	})
+
+	app.Use(logger.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowMethods: "GET,POST,PUT,DELETE,PATCH,OPTIONS",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
+	}))
+
+	app.Static("/uploads", "./uploads")
+
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"status": "ok"})
+	})
+
+	// API v1 routes
+	api := app.Group("/api/v1")
+
+	// Public routes
+	api.Get("/search", h.Search)
+	api.Get("/products", h.GetProducts)
+	api.Get("/products/featured", h.GetFeaturedProducts)
+	api.Get("/products/slug/:slug", h.GetProductBySlug)
+	api.Get("/products/:id/offers", h.GetProductOffers)
+	api.Get("/categories", h.GetCategories)
+	api.Get("/categories/tree", h.GetCategoriesTree)
+	api.Get("/categories/flat", h.GetCategoriesFlat)
+	api.Get("/categories/slug/:slug", h.GetCategoryBySlug)
+	api.Get("/categories/:slug/products", h.GetProductsByCategory)
+	api.Get("/stats", h.GetStats)
+
+	// Admin routes
+	admin := api.Group("/admin")
+	admin.Get("/dashboard", h.AdminDashboard)
+	admin.Post("/sync-elasticsearch", h.SyncToElasticsearch)
+	admin.Get("/products", h.AdminProducts)
+	admin.Get("/products/:id", h.AdminGetProduct)
+	admin.Post("/products", h.AdminCreateProduct)
+	admin.Put("/products/:id", h.AdminUpdateProduct)
+	admin.Delete("/products/:id", h.AdminDeleteProduct)
+	admin.Delete("/products/all", h.DeleteAllProducts)
+	admin.Post("/products/bulk", h.BulkDeleteProducts)
+	admin.Get("/categories", h.AdminCategories)
+	admin.Post("/categories", h.AdminCreateCategory)
+	admin.Put("/categories/:id", h.AdminUpdateCategory)
+	admin.Delete("/categories/:id", h.AdminDeleteCategory)
+	admin.Post("/upload", h.UploadImage)
+	admin.Get("/feeds", h.GetFeeds)
+	admin.Post("/feeds", h.CreateFeed)
+	admin.Post("/feeds/preview", h.PreviewFeed)
+	admin.Put("/feeds/:id", h.UpdateFeed)
+	admin.Delete("/feeds/:id", h.DeleteFeed)
+	admin.Post("/feeds/:id/import", h.StartImport)
+	admin.Get("/feeds/:id/progress", h.GetImportProgress)
+
+	// Legacy routes without /api/v1 prefix (frontend compatibility)
+	app.Get("/products", h.GetProducts)
+	app.Get("/categories", h.GetCategories)
+	app.Get("/categories/tree", h.GetCategoriesTree)
+	app.Get("/categories/flat", h.GetCategoriesFlat)
+	app.Get("/admin/products", h.AdminProducts)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("?? MegaBuy API starting on port %s\n", port)
+	fmt.Printf("?? Elasticsearch: %s\n", os.Getenv("ELASTICSEARCH_URL"))
+	log.Fatal(app.Listen(":" + port))
+}

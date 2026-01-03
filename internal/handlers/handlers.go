@@ -26,9 +26,7 @@ type Handlers struct {
 
 func New(db *database.DB) *Handlers {
 	es := elasticsearch.New()
-	// Create index on startup
 	es.CreateIndex()
-	
 	return &Handlers{db: db, es: es}
 }
 
@@ -78,11 +76,9 @@ func (h *Handlers) Search(c *fiber.Ctx) error {
 	})
 }
 
-// SyncToElasticsearch syncs all products from PostgreSQL to Elasticsearch
 func (h *Handlers) SyncToElasticsearch(c *fiber.Ctx) error {
 	ctx := context.Background()
 	
-	// Get all products
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT p.id, p.title, p.slug, COALESCE(p.description,''), COALESCE(p.short_description,''),
 		       COALESCE(p.ean,''), COALESCE(p.sku,''), COALESCE(p.brand,''),
@@ -108,14 +104,11 @@ func (h *Handlers) SyncToElasticsearch(c *fiber.Ctx) error {
 		products = append(products, p)
 	}
 
-	// Bulk index in batches of 1000
 	batchSize := 1000
 	indexed := 0
 	for i := 0; i < len(products); i += batchSize {
 		end := i + batchSize
-		if end > len(products) {
-			end = len(products)
-		}
+		if end > len(products) { end = len(products) }
 		if err := h.es.BulkIndex(products[i:end]); err != nil {
 			return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error(), "indexed": indexed})
 		}
@@ -134,7 +127,6 @@ func (h *Handlers) SyncToElasticsearch(c *fiber.Ctx) error {
 // ========== PUBLIC API ==========
 
 func (h *Handlers) GetProducts(c *fiber.Ctx) error {
-	// If search query provided, use Elasticsearch
 	if c.Query("q") != "" {
 		return h.Search(c)
 	}
@@ -197,7 +189,7 @@ func (h *Handlers) GetFeaturedProducts(c *fiber.Ctx) error {
 func (h *Handlers) GetProductBySlug(c *fiber.Ctx) error {
 	slug := c.Params("slug")
 	ctx := context.Background()
-	var id, title, pslug, desc, shortDesc, ean, sku, mpn, brand, img, stockStatus, catID, catName string
+	var id, title, pslug, desc, shortDesc, ean, sku, mpn, brand, img, stockStatus, catID, catName, catSlug, affiliateURL string
 	var priceMin, priceMax float64
 	var isActive bool
 	var createdAt time.Time
@@ -205,75 +197,106 @@ func (h *Handlers) GetProductBySlug(c *fiber.Ctx) error {
 		SELECT p.id, p.title, p.slug, COALESCE(p.description,''), COALESCE(p.short_description,''),
 		       COALESCE(p.ean,''), COALESCE(p.sku,''), COALESCE(p.mpn,''), COALESCE(p.brand,''),
 		       COALESCE(p.image_url,''), COALESCE(p.stock_status,'instock'),
-		       COALESCE(p.category_id::text,''), COALESCE(c.name,''),
+		       COALESCE(p.category_id::text,''), COALESCE(c.name,''), COALESCE(c.slug,''),
+		       COALESCE(p.affiliate_url,''),
 		       p.price_min, p.price_max, p.is_active, p.created_at
 		FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.slug = $1
-	`, slug).Scan(&id, &title, &pslug, &desc, &shortDesc, &ean, &sku, &mpn, &brand, &img, &stockStatus, &catID, &catName, &priceMin, &priceMax, &isActive, &createdAt)
+	`, slug).Scan(&id, &title, &pslug, &desc, &shortDesc, &ean, &sku, &mpn, &brand, &img, &stockStatus, &catID, &catName, &catSlug, &affiliateURL, &priceMin, &priceMax, &isActive, &createdAt)
 	if err != nil { return c.Status(404).JSON(fiber.Map{"success": false, "error": "Product not found"}) }
 
-	imgRows, _ := h.db.Pool.Query(ctx, `SELECT id, url, COALESCE(alt,''), position, is_main FROM product_images WHERE product_id = $1::uuid ORDER BY position`, id)
+	// Get images
+	imgRows, _ := h.db.Pool.Query(ctx, `SELECT url FROM product_images WHERE product_id = $1::uuid ORDER BY position`, id)
 	defer imgRows.Close()
-	var images []fiber.Map
+	var images []string
 	for imgRows.Next() {
-		var imgID, imgURL, imgAlt string; var imgPos int; var imgMain bool
-		imgRows.Scan(&imgID, &imgURL, &imgAlt, &imgPos, &imgMain)
-		images = append(images, fiber.Map{"id": imgID, "url": imgURL, "alt": imgAlt, "position": imgPos, "is_main": imgMain})
-	}
-
-	attrRows, _ := h.db.Pool.Query(ctx, `SELECT name, value FROM product_attributes WHERE product_id = $1::uuid ORDER BY position`, id)
-	defer attrRows.Close()
-	var attrs []fiber.Map
-	for attrRows.Next() {
-		var name, value string
-		attrRows.Scan(&name, &value)
-		attrs = append(attrs, fiber.Map{"name": name, "value": value})
+		var imgURL string
+		imgRows.Scan(&imgURL)
+		images = append(images, imgURL)
 	}
 
 	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{
 		"id": id, "title": title, "slug": pslug, "description": desc, "short_description": shortDesc,
-		"ean": ean, "sku": sku, "mpn": mpn, "brand": brand, "image_url": img, "images": images, "attributes": attrs,
-		"stock_status": stockStatus, "category_id": catID, "category_name": catName,
-		"price_min": priceMin, "price_max": priceMax, "is_active": isActive, "created_at": createdAt,
+		"ean": ean, "sku": sku, "mpn": mpn, "brand": brand, "image_url": img, "images": images,
+		"stock_status": stockStatus, "category_id": catID, "category_name": catName, "category_slug": catSlug,
+		"affiliate_url": affiliateURL, "price_min": priceMin, "price_max": priceMax, "is_active": isActive, "created_at": createdAt,
 	}})
 }
 
 func (h *Handlers) GetCategories(c *fiber.Ctx) error {
-	tree := c.Query("tree") == "true"
 	ctx := context.Background()
-	rows, _ := h.db.Pool.Query(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(description,''), COALESCE(icon,''), COALESCE(image_url,''), product_count FROM categories WHERE is_active=true ORDER BY sort_order, name`)
+	rows, _ := h.db.Pool.Query(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(icon,''), product_count FROM categories WHERE is_active=true ORDER BY sort_order, name`)
+	defer rows.Close()
+
+	var cats []fiber.Map
+	for rows.Next() {
+		var id, parentID, name, slug, icon string
+		var productCount int
+		rows.Scan(&id, &parentID, &name, &slug, &icon, &productCount)
+		cats = append(cats, fiber.Map{"id": id, "parent_id": parentID, "name": name, "slug": slug, "icon": icon, "product_count": productCount})
+	}
+	if cats == nil { cats = []fiber.Map{} }
+	return c.JSON(fiber.Map{"success": true, "data": cats})
+}
+
+func (h *Handlers) GetCategoriesTree(c *fiber.Ctx) error {
+	ctx := context.Background()
+	rows, _ := h.db.Pool.Query(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(icon,''), product_count FROM categories WHERE is_active=true ORDER BY sort_order, name`)
 	defer rows.Close()
 
 	type Cat struct {
-		ID string `json:"id"`; ParentID string `json:"parent_id,omitempty"`; Name string `json:"name"`
-		Slug string `json:"slug"`; Description string `json:"description,omitempty"`; Icon string `json:"icon,omitempty"`
-		ImageURL string `json:"image_url,omitempty"`; ProductCount int `json:"product_count"`; Children []*Cat `json:"children,omitempty"`
+		ID string `json:"id"`
+		ParentID string `json:"parent_id,omitempty"`
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+		Icon string `json:"icon,omitempty"`
+		ProductCount int `json:"product_count"`
+		Children []*Cat `json:"children,omitempty"`
 	}
 	var cats []*Cat
 	catMap := make(map[string]*Cat)
 	for rows.Next() {
 		cat := &Cat{}
-		rows.Scan(&cat.ID, &cat.ParentID, &cat.Name, &cat.Slug, &cat.Description, &cat.Icon, &cat.ImageURL, &cat.ProductCount)
+		rows.Scan(&cat.ID, &cat.ParentID, &cat.Name, &cat.Slug, &cat.Icon, &cat.ProductCount)
 		cats = append(cats, cat)
 		catMap[cat.ID] = cat
 	}
-	if !tree { return c.JSON(fiber.Map{"success": true, "data": cats}) }
 
 	var roots []*Cat
 	for _, cat := range cats {
-		if cat.ParentID == "" { roots = append(roots, cat) } else if parent, ok := catMap[cat.ParentID]; ok { parent.Children = append(parent.Children, cat) }
+		if cat.ParentID == "" {
+			roots = append(roots, cat)
+		} else if parent, ok := catMap[cat.ParentID]; ok {
+			parent.Children = append(parent.Children, cat)
+		}
 	}
 	if roots == nil { roots = []*Cat{} }
 	return c.JSON(fiber.Map{"success": true, "data": roots})
 }
 
+func (h *Handlers) GetCategoriesFlat(c *fiber.Ctx) error {
+	ctx := context.Background()
+	rows, _ := h.db.Pool.Query(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(icon,''), product_count FROM categories WHERE is_active=true ORDER BY name`)
+	defer rows.Close()
+
+	var cats []fiber.Map
+	for rows.Next() {
+		var id, parentID, name, slug, icon string
+		var productCount int
+		rows.Scan(&id, &parentID, &name, &slug, &icon, &productCount)
+		cats = append(cats, fiber.Map{"id": id, "parent_id": parentID, "name": name, "slug": slug, "icon": icon, "product_count": productCount})
+	}
+	if cats == nil { cats = []fiber.Map{} }
+	return c.JSON(fiber.Map{"success": true, "data": cats})
+}
+
 func (h *Handlers) GetCategoryBySlug(c *fiber.Ctx) error {
 	slug := c.Params("slug")
 	ctx := context.Background()
-	var id, parentID, name, cslug, desc, icon, imgURL string
+	var id, parentID, name, cslug, desc, icon string
 	var productCount int
-	err := h.db.Pool.QueryRow(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(description,''), COALESCE(icon,''), COALESCE(image_url,''), product_count FROM categories WHERE slug = $1 AND is_active=true`, slug).Scan(&id, &parentID, &name, &cslug, &desc, &icon, &imgURL, &productCount)
+	err := h.db.Pool.QueryRow(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(description,''), COALESCE(icon,''), product_count FROM categories WHERE slug = $1 AND is_active=true`, slug).Scan(&id, &parentID, &name, &cslug, &desc, &icon, &productCount)
 	if err != nil { return c.Status(404).JSON(fiber.Map{"success": false, "error": "Category not found"}) }
-	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"id": id, "parent_id": parentID, "name": name, "slug": cslug, "description": desc, "icon": icon, "image_url": imgURL, "product_count": productCount}})
+	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"id": id, "parent_id": parentID, "name": name, "slug": cslug, "description": desc, "icon": icon, "product_count": productCount}})
 }
 
 func (h *Handlers) GetProductsByCategory(c *fiber.Ctx) error {
@@ -282,13 +305,15 @@ func (h *Handlers) GetProductsByCategory(c *fiber.Ctx) error {
 	var categoryID string
 	err := h.db.Pool.QueryRow(ctx, "SELECT id FROM categories WHERE slug = $1", slug).Scan(&categoryID)
 	if err != nil { return c.Status(404).JSON(fiber.Map{"success": false, "error": "Category not found"}) }
-	rows, _ := h.db.Pool.Query(ctx, `SELECT p.id, p.title, p.slug, COALESCE(p.image_url,''), p.price_min, p.price_max, COALESCE(p.stock_status,'instock') FROM products p WHERE p.category_id = $1::uuid AND p.is_active=true ORDER BY p.created_at DESC`, categoryID)
+	
+	rows, _ := h.db.Pool.Query(ctx, `SELECT p.id, p.title, p.slug, COALESCE(p.image_url,''), p.price_min, p.price_max FROM products p WHERE p.category_id = $1::uuid AND p.is_active=true ORDER BY p.created_at DESC`, categoryID)
 	defer rows.Close()
 	var products []fiber.Map
 	for rows.Next() {
-		var id, title, slug, img, stockStatus string; var pmin, pmax float64
-		rows.Scan(&id, &title, &slug, &img, &pmin, &pmax, &stockStatus)
-		products = append(products, fiber.Map{"id": id, "title": title, "slug": slug, "image_url": img, "price_min": pmin, "price_max": pmax, "stock_status": stockStatus})
+		var id, title, slug, img string
+		var pmin, pmax float64
+		rows.Scan(&id, &title, &slug, &img, &pmin, &pmax)
+		products = append(products, fiber.Map{"id": id, "title": title, "slug": slug, "image_url": img, "price_min": pmin, "price_max": pmax})
 	}
 	if products == nil { products = []fiber.Map{} }
 	return c.JSON(fiber.Map{"success": true, "data": products})
@@ -296,15 +321,34 @@ func (h *Handlers) GetProductsByCategory(c *fiber.Ctx) error {
 
 func (h *Handlers) GetStats(c *fiber.Ctx) error {
 	ctx := context.Background()
-	var p, v, cat, o int64
+	var p, cat int64
 	h.db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM products WHERE is_active=true").Scan(&p)
-	h.db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM vendors WHERE is_active=true").Scan(&v)
 	h.db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM categories WHERE is_active=true").Scan(&cat)
-	h.db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM offers WHERE is_active=true").Scan(&o)
-	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"products": p, "vendors": v, "categories": cat, "offers": o}})
+	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"products": p, "categories": cat}})
 }
 
 func (h *Handlers) AdminDashboard(c *fiber.Ctx) error { return h.GetStats(c) }
+
+func (h *Handlers) GetProductOffers(c *fiber.Ctx) error {
+	productID := c.Params("id")
+	ctx := context.Background()
+	
+	var priceMin float64
+	var stockStatus, affiliateURL string
+	h.db.Pool.QueryRow(ctx, "SELECT price_min, COALESCE(stock_status,'instock'), COALESCE(affiliate_url,'') FROM products WHERE id = $1::uuid", productID).Scan(&priceMin, &stockStatus, &affiliateURL)
+	
+	shippingPrice := 2.99
+	if priceMin >= 49 { shippingPrice = 0 }
+	
+	return c.JSON(fiber.Map{"success": true, "data": []fiber.Map{{
+		"id": "default", "vendor_id": "megabuy", "vendor_name": "MegaBuy.sk",
+		"vendor_logo": "", "vendor_rating": 4.8, "vendor_reviews": 1250,
+		"price": priceMin, "shipping_price": shippingPrice, "delivery_days": "1-2",
+		"stock_status": stockStatus, "stock_quantity": 10, "is_megabuy": true, "affiliate_url": affiliateURL,
+	}}})
+}
+
+// ========== ADMIN API ==========
 
 func (h *Handlers) AdminProducts(c *fiber.Ctx) error {
 	page := c.QueryInt("page", 1)
@@ -339,7 +383,9 @@ func (h *Handlers) AdminProducts(c *fiber.Ctx) error {
 	var products []fiber.Map
 	for pgRows.Next() {
 		var id, title, slug, ean, sku, img, stockStatus, catName string
-		var pmin, pmax float64; var isActive bool; var createdAt time.Time
+		var pmin, pmax float64
+		var isActive bool
+		var createdAt time.Time
 		pgRows.Scan(&id, &title, &slug, &ean, &sku, &img, &pmin, &pmax, &isActive, &stockStatus, &catName, &createdAt)
 		products = append(products, fiber.Map{"id": id, "title": title, "slug": slug, "ean": ean, "sku": sku, "image_url": img, "price_min": pmin, "price_max": pmax, "is_active": isActive, "stock_status": stockStatus, "category_name": catName, "created_at": createdAt})
 	}
@@ -351,7 +397,9 @@ func (h *Handlers) AdminGetProduct(c *fiber.Ctx) error {
 	productID := c.Params("id")
 	ctx := context.Background()
 	var id, title, slug, desc, shortDesc, ean, sku, mpn, brand, img, stockStatus, catID string
-	var priceMin, priceMax float64; var isActive, isFeatured bool; var createdAt, updatedAt time.Time
+	var priceMin, priceMax float64
+	var isActive, isFeatured bool
+	var createdAt, updatedAt time.Time
 	err := h.db.Pool.QueryRow(ctx, `SELECT id, title, slug, COALESCE(description,''), COALESCE(short_description,''), COALESCE(ean,''), COALESCE(sku,''), COALESCE(mpn,''), COALESCE(brand,''), COALESCE(image_url,''), COALESCE(stock_status,'instock'), COALESCE(category_id::text,''), price_min, price_max, is_active, COALESCE(is_featured,false), created_at, updated_at FROM products WHERE id = $1::uuid`, productID).Scan(&id, &title, &slug, &desc, &shortDesc, &ean, &sku, &mpn, &brand, &img, &stockStatus, &catID, &priceMin, &priceMax, &isActive, &isFeatured, &createdAt, &updatedAt)
 	if err != nil { return c.Status(404).JSON(fiber.Map{"success": false, "error": "Product not found"}) }
 
@@ -359,31 +407,32 @@ func (h *Handlers) AdminGetProduct(c *fiber.Ctx) error {
 	defer imgRows.Close()
 	var images []fiber.Map
 	for imgRows.Next() {
-		var imgID, imgURL, imgAlt string; var imgPos int; var imgMain bool
+		var imgID, imgURL, imgAlt string
+		var imgPos int
+		var imgMain bool
 		imgRows.Scan(&imgID, &imgURL, &imgAlt, &imgPos, &imgMain)
 		images = append(images, fiber.Map{"id": imgID, "url": imgURL, "alt": imgAlt, "position": imgPos, "is_main": imgMain})
 	}
 
-	attrRows, _ := h.db.Pool.Query(ctx, `SELECT id, name, value, position FROM product_attributes WHERE product_id = $1::uuid ORDER BY position`, productID)
-	defer attrRows.Close()
-	var attrs []fiber.Map
-	for attrRows.Next() {
-		var attrID, name, value string; var pos int
-		attrRows.Scan(&attrID, &name, &value, &pos)
-		attrs = append(attrs, fiber.Map{"id": attrID, "name": name, "value": value, "position": pos})
-	}
-
-	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"id": id, "title": title, "slug": slug, "description": desc, "short_description": shortDesc, "ean": ean, "sku": sku, "mpn": mpn, "brand": brand, "image_url": img, "images": images, "attributes": attrs, "stock_status": stockStatus, "category_id": catID, "price_min": priceMin, "price_max": priceMax, "is_active": isActive, "is_featured": isFeatured, "created_at": createdAt, "updated_at": updatedAt}})
+	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"id": id, "title": title, "slug": slug, "description": desc, "short_description": shortDesc, "ean": ean, "sku": sku, "mpn": mpn, "brand": brand, "image_url": img, "images": images, "stock_status": stockStatus, "category_id": catID, "price_min": priceMin, "price_max": priceMax, "is_active": isActive, "is_featured": isFeatured, "created_at": createdAt, "updated_at": updatedAt}})
 }
 
 func (h *Handlers) AdminCreateProduct(c *fiber.Ctx) error {
 	var input struct {
-		Title string `json:"title"`; Slug string `json:"slug"`; Description string `json:"description"`
-		ShortDescription string `json:"short_description"`; EAN string `json:"ean"`; SKU string `json:"sku"`
-		MPN string `json:"mpn"`; Brand string `json:"brand_name"`; CategoryID string `json:"category_id"`
-		ImageURL string `json:"image_url"`; Images []map[string]interface{} `json:"images"`
-		Attributes []map[string]interface{} `json:"attributes"`; PriceMin float64 `json:"price_min"`
-		PriceMax float64 `json:"price_max"`; StockStatus string `json:"stock_status"`; IsActive bool `json:"is_active"`
+		Title string `json:"title"`
+		Slug string `json:"slug"`
+		Description string `json:"description"`
+		ShortDescription string `json:"short_description"`
+		EAN string `json:"ean"`
+		SKU string `json:"sku"`
+		MPN string `json:"mpn"`
+		Brand string `json:"brand_name"`
+		CategoryID string `json:"category_id"`
+		ImageURL string `json:"image_url"`
+		PriceMin float64 `json:"price_min"`
+		PriceMax float64 `json:"price_max"`
+		StockStatus string `json:"stock_status"`
+		IsActive bool `json:"is_active"`
 	}
 	if err := c.BodyParser(&input); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"}) }
 	if input.Title == "" { return c.Status(400).JSON(fiber.Map{"success": false, "error": "Title required"}) }
@@ -399,29 +448,7 @@ func (h *Handlers) AdminCreateProduct(c *fiber.Ctx) error {
 	_, err := h.db.Pool.Exec(ctx, `INSERT INTO products (id, category_id, title, slug, description, short_description, ean, sku, mpn, brand, image_url, price_min, price_max, stock_status, is_active, created_at, updated_at) VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())`, productID, catID, input.Title, input.Slug, input.Description, input.ShortDescription, input.EAN, input.SKU, input.MPN, input.Brand, input.ImageURL, input.PriceMin, input.PriceMax, input.StockStatus, input.IsActive)
 	if err != nil { return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()}) }
 
-	for i, img := range input.Images {
-		imgURL, _ := img["url"].(string); imgAlt, _ := img["alt"].(string); isMain := i == 0
-		if v, ok := img["is_main"].(bool); ok { isMain = v }
-		h.db.Pool.Exec(ctx, `INSERT INTO product_images (id, product_id, url, alt, position, is_main) VALUES ($1, $2, $3, $4, $5, $6)`, uuid.New(), productID, imgURL, imgAlt, i, isMain)
-	}
-	for i, attr := range input.Attributes {
-		name, _ := attr["name"].(string); value, _ := attr["value"].(string)
-		if name != "" && value != "" { h.db.Pool.Exec(ctx, `INSERT INTO product_attributes (id, product_id, name, value, position) VALUES ($1, $2, $3, $4, $5)`, uuid.New(), productID, name, value, i) }
-	}
 	if input.CategoryID != "" { h.db.Pool.Exec(ctx, `UPDATE categories SET product_count = (SELECT COUNT(*) FROM products WHERE category_id = $1::uuid AND is_active=true) WHERE id = $1::uuid`, input.CategoryID) }
-
-	// Index to Elasticsearch
-	var catName, catSlug string
-	if input.CategoryID != "" {
-		h.db.Pool.QueryRow(ctx, "SELECT name, slug FROM categories WHERE id = $1::uuid", input.CategoryID).Scan(&catName, &catSlug)
-	}
-	h.es.IndexProduct(elasticsearch.Product{
-		ID: productID.String(), Title: input.Title, Slug: input.Slug, Description: input.Description,
-		ShortDescription: input.ShortDescription, EAN: input.EAN, SKU: input.SKU, Brand: input.Brand,
-		CategoryID: input.CategoryID, CategoryName: catName, CategorySlug: catSlug,
-		ImageURL: input.ImageURL, PriceMin: input.PriceMin, PriceMax: input.PriceMax,
-		StockStatus: input.StockStatus, IsActive: input.IsActive, CreatedAt: time.Now().Format(time.RFC3339),
-	})
 
 	return c.Status(201).JSON(fiber.Map{"success": true, "data": fiber.Map{"id": productID.String(), "slug": input.Slug}})
 }
@@ -429,12 +456,20 @@ func (h *Handlers) AdminCreateProduct(c *fiber.Ctx) error {
 func (h *Handlers) AdminUpdateProduct(c *fiber.Ctx) error {
 	productID := c.Params("id")
 	var input struct {
-		Title string `json:"title"`; Slug string `json:"slug"`; Description string `json:"description"`
-		ShortDescription string `json:"short_description"`; EAN string `json:"ean"`; SKU string `json:"sku"`
-		MPN string `json:"mpn"`; Brand string `json:"brand_name"`; CategoryID string `json:"category_id"`
-		ImageURL string `json:"image_url"`; Images []map[string]interface{} `json:"images"`
-		Attributes []map[string]interface{} `json:"attributes"`; PriceMin float64 `json:"price_min"`
-		PriceMax float64 `json:"price_max"`; StockStatus string `json:"stock_status"`; IsActive bool `json:"is_active"`
+		Title string `json:"title"`
+		Slug string `json:"slug"`
+		Description string `json:"description"`
+		ShortDescription string `json:"short_description"`
+		EAN string `json:"ean"`
+		SKU string `json:"sku"`
+		MPN string `json:"mpn"`
+		Brand string `json:"brand_name"`
+		CategoryID string `json:"category_id"`
+		ImageURL string `json:"image_url"`
+		PriceMin float64 `json:"price_min"`
+		PriceMax float64 `json:"price_max"`
+		StockStatus string `json:"stock_status"`
+		IsActive bool `json:"is_active"`
 	}
 	if err := c.BodyParser(&input); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"}) }
 
@@ -445,92 +480,99 @@ func (h *Handlers) AdminUpdateProduct(c *fiber.Ctx) error {
 	_, err := h.db.Pool.Exec(ctx, `UPDATE products SET category_id = $2::uuid, title = COALESCE(NULLIF($3,''), title), slug = COALESCE(NULLIF($4,''), slug), description = $5, short_description = $6, ean = $7, sku = $8, mpn = $9, brand = $10, image_url = $11, price_min = $12, price_max = $13, stock_status = $14, is_active = $15, updated_at = NOW() WHERE id = $1::uuid`, productID, catID, input.Title, input.Slug, input.Description, input.ShortDescription, input.EAN, input.SKU, input.MPN, input.Brand, input.ImageURL, input.PriceMin, input.PriceMax, input.StockStatus, input.IsActive)
 	if err != nil { return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()}) }
 
-	if input.Images != nil {
-		h.db.Pool.Exec(ctx, "DELETE FROM product_images WHERE product_id = $1::uuid", productID)
-		for i, img := range input.Images {
-			imgURL, _ := img["url"].(string); imgAlt, _ := img["alt"].(string); isMain := i == 0
-			if v, ok := img["is_main"].(bool); ok { isMain = v }
-			h.db.Pool.Exec(ctx, `INSERT INTO product_images (id, product_id, url, alt, position, is_main) VALUES ($1, $2::uuid, $3, $4, $5, $6)`, uuid.New(), productID, imgURL, imgAlt, i, isMain)
-		}
-	}
-	if input.Attributes != nil {
-		h.db.Pool.Exec(ctx, "DELETE FROM product_attributes WHERE product_id = $1::uuid", productID)
-		for i, attr := range input.Attributes {
-			name, _ := attr["name"].(string); value, _ := attr["value"].(string)
-			if name != "" && value != "" { h.db.Pool.Exec(ctx, `INSERT INTO product_attributes (id, product_id, name, value, position) VALUES ($1, $2::uuid, $3, $4, $5)`, uuid.New(), productID, name, value, i) }
-		}
-	}
-
-	// Update Elasticsearch
-	var catName, catSlug string
-	if input.CategoryID != "" {
-		h.db.Pool.QueryRow(ctx, "SELECT name, slug FROM categories WHERE id = $1::uuid", input.CategoryID).Scan(&catName, &catSlug)
-	}
-	h.es.IndexProduct(elasticsearch.Product{
-		ID: productID, Title: input.Title, Slug: input.Slug, Description: input.Description,
-		ShortDescription: input.ShortDescription, EAN: input.EAN, SKU: input.SKU, Brand: input.Brand,
-		CategoryID: input.CategoryID, CategoryName: catName, CategorySlug: catSlug,
-		ImageURL: input.ImageURL, PriceMin: input.PriceMin, PriceMax: input.PriceMax,
-		StockStatus: input.StockStatus, IsActive: input.IsActive, CreatedAt: time.Now().Format(time.RFC3339),
-	})
-
 	return c.JSON(fiber.Map{"success": true, "message": "Product updated"})
 }
 
 func (h *Handlers) AdminDeleteProduct(c *fiber.Ctx) error {
 	productID := c.Params("id")
 	ctx := context.Background()
+	h.db.Pool.Exec(ctx, "DELETE FROM product_images WHERE product_id = $1::uuid", productID)
+	h.db.Pool.Exec(ctx, "DELETE FROM product_attributes WHERE product_id = $1::uuid", productID)
 	_, err := h.db.Pool.Exec(ctx, "DELETE FROM products WHERE id = $1::uuid", productID)
 	if err != nil { return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()}) }
-	
-	// Delete from Elasticsearch
 	h.es.DeleteProduct(productID)
-	
 	return c.JSON(fiber.Map{"success": true, "message": "Product deleted"})
 }
 
-func (h *Handlers) AdminCategories(c *fiber.Ctx) error {
-	flat := c.Query("flat") == "true"
+func (h *Handlers) DeleteAllProducts(c *fiber.Ctx) error {
 	ctx := context.Background()
-	rows, _ := h.db.Pool.Query(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(description,''), COALESCE(icon,''), product_count, sort_order, is_active FROM categories ORDER BY sort_order, name`)
+
+	var count int
+	h.db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM products").Scan(&count)
+
+	h.db.Pool.Exec(ctx, "DELETE FROM product_images")
+	h.db.Pool.Exec(ctx, "DELETE FROM product_attributes")
+	h.db.Pool.Exec(ctx, "DELETE FROM products")
+	h.db.Pool.Exec(ctx, "UPDATE categories SET product_count = 0")
+
+	os.RemoveAll("./uploads/products")
+	os.MkdirAll("./uploads/products", 0755)
+
+	if h.es != nil {
+		h.es.DeleteIndex()
+		h.es.CreateIndex()
+	}
+
+	return c.JSON(fiber.Map{"success": true, "message": fmt.Sprintf("Deleted %d products", count), "count": count})
+}
+
+func (h *Handlers) BulkDeleteProducts(c *fiber.Ctx) error {
+	var input struct {
+		IDs    []string `json:"ids"`
+		Action string   `json:"action"`
+	}
+	if err := c.BodyParser(&input); err != nil {
+		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"})
+	}
+
+	ctx := context.Background()
+
+	switch input.Action {
+	case "delete":
+		for _, id := range input.IDs {
+			h.db.Pool.Exec(ctx, "DELETE FROM product_images WHERE product_id = $1::uuid", id)
+			h.db.Pool.Exec(ctx, "DELETE FROM product_attributes WHERE product_id = $1::uuid", id)
+			h.db.Pool.Exec(ctx, "DELETE FROM products WHERE id = $1::uuid", id)
+			h.es.DeleteProduct(id)
+		}
+	case "activate":
+		for _, id := range input.IDs {
+			h.db.Pool.Exec(ctx, "UPDATE products SET is_active = true WHERE id = $1::uuid", id)
+		}
+	case "deactivate":
+		for _, id := range input.IDs {
+			h.db.Pool.Exec(ctx, "UPDATE products SET is_active = false WHERE id = $1::uuid", id)
+		}
+	}
+
+	return c.JSON(fiber.Map{"success": true, "message": fmt.Sprintf("Processed %d products", len(input.IDs))})
+}
+
+func (h *Handlers) AdminCategories(c *fiber.Ctx) error {
+	ctx := context.Background()
+	rows, _ := h.db.Pool.Query(ctx, `SELECT id, COALESCE(parent_id::text,''), name, slug, COALESCE(icon,''), product_count, is_active FROM categories ORDER BY sort_order, name`)
 	defer rows.Close()
 
-	type Cat struct {
-		ID string `json:"id"`; ParentID string `json:"parent_id"`; Name string `json:"name"`; Slug string `json:"slug"`
-		Description string `json:"description"`; Icon string `json:"icon"`; ProductCount int `json:"product_count"`
-		SortOrder int `json:"sort_order"`; IsActive bool `json:"is_active"`; Depth int `json:"depth"`; Path string `json:"path"`
-	}
-	var cats []Cat
-	catMap := make(map[string]*Cat)
+	var cats []fiber.Map
 	for rows.Next() {
-		var cat Cat
-		rows.Scan(&cat.ID, &cat.ParentID, &cat.Name, &cat.Slug, &cat.Description, &cat.Icon, &cat.ProductCount, &cat.SortOrder, &cat.IsActive)
-		cats = append(cats, cat)
-		catMap[cat.ID] = &cats[len(cats)-1]
+		var id, parentID, name, slug, icon string
+		var productCount int
+		var isActive bool
+		rows.Scan(&id, &parentID, &name, &slug, &icon, &productCount, &isActive)
+		cats = append(cats, fiber.Map{"id": id, "parent_id": parentID, "name": name, "slug": slug, "icon": icon, "product_count": productCount, "is_active": isActive})
 	}
-
-	if flat {
-		var calcDepth func(cat *Cat) int
-		calcDepth = func(cat *Cat) int {
-			if cat.ParentID == "" { return 0 }
-			if parent, ok := catMap[cat.ParentID]; ok { return calcDepth(parent) + 1 }
-			return 0
-		}
-		var calcPath func(cat *Cat) string
-		calcPath = func(cat *Cat) string {
-			if cat.ParentID == "" { return cat.Name }
-			if parent, ok := catMap[cat.ParentID]; ok { return calcPath(parent) + " > " + cat.Name }
-			return cat.Name
-		}
-		for i := range cats { cats[i].Depth = calcDepth(&cats[i]); cats[i].Path = calcPath(&cats[i]) }
-		for i := 0; i < len(cats)-1; i++ { for j := 0; j < len(cats)-i-1; j++ { if cats[j].Path > cats[j+1].Path { cats[j], cats[j+1] = cats[j+1], cats[j] } } }
-	}
-	if cats == nil { cats = []Cat{} }
+	if cats == nil { cats = []fiber.Map{} }
 	return c.JSON(fiber.Map{"success": true, "data": cats})
 }
 
 func (h *Handlers) AdminCreateCategory(c *fiber.Ctx) error {
-	var input struct { ParentID string `json:"parent_id"`; Name string `json:"name"`; Slug string `json:"slug"`; Description string `json:"description"`; Icon string `json:"icon"` }
+	var input struct {
+		ParentID string `json:"parent_id"`
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+		Description string `json:"description"`
+		Icon string `json:"icon"`
+	}
 	if err := c.BodyParser(&input); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"}) }
 	if input.Name == "" { return c.Status(400).JSON(fiber.Map{"success": false, "error": "Name required"}) }
 	if input.Slug == "" { input.Slug = makeSlug(input.Name) }
@@ -549,7 +591,14 @@ func (h *Handlers) AdminCreateCategory(c *fiber.Ctx) error {
 
 func (h *Handlers) AdminUpdateCategory(c *fiber.Ctx) error {
 	categoryID := c.Params("id")
-	var input struct { ParentID string `json:"parent_id"`; Name string `json:"name"`; Slug string `json:"slug"`; Description string `json:"description"`; Icon string `json:"icon"`; IsActive bool `json:"is_active"` }
+	var input struct {
+		ParentID string `json:"parent_id"`
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+		Description string `json:"description"`
+		Icon string `json:"icon"`
+		IsActive bool `json:"is_active"`
+	}
 	if err := c.BodyParser(&input); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"}) }
 
 	ctx := context.Background()
@@ -584,80 +633,4 @@ func (h *Handlers) UploadImage(c *fiber.Ctx) error {
 	baseURL := c.BaseURL()
 	url := fmt.Sprintf("%s/uploads/%s", baseURL, filename)
 	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"url": url, "filename": filename}})
-}
-
-// GetProductOffers returns all offers for a product
-func (h *Handlers) GetProductOffers(c *fiber.Ctx) error {
-	productID := c.Params("id")
-	ctx := context.Background()
-	
-	// Get offers from database
-	rows, err := h.db.Pool.Query(ctx, `
-		SELECT o.id, o.vendor_id, COALESCE(v.name,'MegaBuy.sk'), COALESCE(v.logo_url,''), 
-		       COALESCE(v.rating, 4.8), COALESCE(v.review_count, 1250),
-		       o.price, COALESCE(o.shipping_price, 0), COALESCE(o.delivery_days, '1-2'),
-		       COALESCE(o.stock_status, 'instock'), COALESCE(o.stock_quantity, 10),
-		       COALESCE(o.is_megabuy, true), COALESCE(o.affiliate_url, '')
-		FROM offers o
-		LEFT JOIN vendors v ON o.vendor_id = v.id
-		WHERE o.product_id = $1::uuid AND o.is_active = true
-		ORDER BY o.price ASC
-	`, productID)
-	
-	if err != nil {
-		// If no offers table or error, return default MegaBuy offer
-		var priceMin float64
-		var stockStatus string
-		h.db.Pool.QueryRow(ctx, "SELECT price_min, COALESCE(stock_status,'instock') FROM products WHERE id = $1::uuid", productID).Scan(&priceMin, &stockStatus)
-		
-		shippingPrice := 2.99
-		if priceMin >= 49 { shippingPrice = 0 }
-		
-		return c.JSON(fiber.Map{"success": true, "data": []fiber.Map{{
-			"id": "default", "vendor_id": "megabuy", "vendor_name": "MegaBuy.sk",
-			"vendor_logo": "", "vendor_rating": 4.8, "vendor_reviews": 1250,
-			"price": priceMin, "shipping_price": shippingPrice, "delivery_days": "1-2",
-			"stock_status": stockStatus, "stock_quantity": 10, "is_megabuy": true, "affiliate_url": "",
-		}}})
-	}
-	defer rows.Close()
-
-	var offers []fiber.Map
-	for rows.Next() {
-		var id, vendorID, vendorName, vendorLogo, deliveryDays, stockStatus, affiliateURL string
-		var vendorRating float64
-		var vendorReviews, stockQty int
-		var price, shippingPrice float64
-		var isMegabuy bool
-		
-		rows.Scan(&id, &vendorID, &vendorName, &vendorLogo, &vendorRating, &vendorReviews,
-			&price, &shippingPrice, &deliveryDays, &stockStatus, &stockQty, &isMegabuy, &affiliateURL)
-		
-		offers = append(offers, fiber.Map{
-			"id": id, "vendor_id": vendorID, "vendor_name": vendorName,
-			"vendor_logo": vendorLogo, "vendor_rating": vendorRating, "vendor_reviews": vendorReviews,
-			"price": price, "shipping_price": shippingPrice, "delivery_days": deliveryDays,
-			"stock_status": stockStatus, "stock_quantity": stockQty, "is_megabuy": isMegabuy,
-			"affiliate_url": affiliateURL,
-		})
-	}
-
-	// If no offers found, return default
-	if len(offers) == 0 {
-		var priceMin float64
-		var stockStatus string
-		h.db.Pool.QueryRow(ctx, "SELECT price_min, COALESCE(stock_status,'instock') FROM products WHERE id = $1::uuid", productID).Scan(&priceMin, &stockStatus)
-		
-		shippingPrice := 2.99
-		if priceMin >= 49 { shippingPrice = 0 }
-		
-		offers = []fiber.Map{{
-			"id": "default", "vendor_id": "megabuy", "vendor_name": "MegaBuy.sk",
-			"vendor_logo": "", "vendor_rating": 4.8, "vendor_reviews": 1250,
-			"price": priceMin, "shipping_price": shippingPrice, "delivery_days": "1-2",
-			"stock_status": stockStatus, "stock_quantity": 10, "is_megabuy": true, "affiliate_url": "",
-		}}
-	}
-
-	return c.JSON(fiber.Map{"success": true, "data": offers})
 }
