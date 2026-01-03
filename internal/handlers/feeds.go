@@ -200,7 +200,7 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "URL required"})
 	}
 
-	data, err := downloadFeedData(input.URL, 200*1024)
+	data, err := downloadFeedData(input.URL, 500*1024) // 500KB for preview
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Cannot download feed: " + err.Error()})
 	}
@@ -217,10 +217,15 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 		}
 	}
 
+	itemPath := input.XMLItemPath
+	if itemPath == "" {
+		itemPath = "SHOPITEM"
+	}
+
 	var preview FeedPreview
 	switch detectedType {
 	case "xml":
-		preview = parseXMLPreview(data, input.XMLItemPath)
+		preview = parseXMLPreview(data, itemPath)
 	case "json":
 		preview = parseJSONPreview(data)
 	case "csv":
@@ -238,7 +243,7 @@ func (h *Handlers) StartImport(c *fiber.Ctx) error {
 	var feed Feed
 	var fieldMappingStr string
 	err := h.db.Pool.QueryRow(ctx, `
-		SELECT id, name, url, type, xml_item_path, COALESCE(field_mapping::text,'{}')
+		SELECT id, name, url, type, COALESCE(xml_item_path,'SHOPITEM'), COALESCE(field_mapping::text,'{}')
 		FROM feeds WHERE id=$1::uuid
 	`, feedID).Scan(&feed.ID, &feed.Name, &feed.URL, &feed.Type, &feed.XMLItemPath, &fieldMappingStr)
 	if err != nil {
@@ -263,6 +268,7 @@ func (h *Handlers) StartImport(c *fiber.Ctx) error {
 }
 
 func downloadFeedData(url string, maxBytes int) ([]byte, error) {
+	// Support local files
 	if strings.HasPrefix(url, "/") {
 		data, err := os.ReadFile(url)
 		if err != nil {
@@ -274,13 +280,14 @@ func downloadFeedData(url string, maxBytes int) ([]byte, error) {
 		return data, nil
 	}
 
+	// HTTP download with robust settings
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		DisableCompression:    false,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	client := &http.Client{
 		Timeout:   15 * time.Minute,
@@ -291,8 +298,9 @@ func downloadFeedData(url string, maxBytes int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MegaBuy/1.0)")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -317,10 +325,26 @@ func (h *Handlers) runImport(feed Feed) {
 	ctx := context.Background()
 	feedID := feed.ID
 
+	defer func() {
+		if r := recover(); r != nil {
+			progressMutex.Lock()
+			if p, ok := importProgress[feedID]; ok {
+				p.Status = "failed"
+				p.Message = fmt.Sprintf("Panic: %v", r)
+				p.Logs = append(p.Logs, fmt.Sprintf("Error: %v", r))
+			}
+			progressMutex.Unlock()
+			h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='failed' WHERE id=$1::uuid", feedID)
+		}
+	}()
+
 	addLog := func(msg string) {
 		progressMutex.Lock()
 		if p, ok := importProgress[feedID]; ok {
 			p.Logs = append(p.Logs, msg)
+			if len(p.Logs) > 100 {
+				p.Logs = p.Logs[len(p.Logs)-100:]
+			}
 		}
 		progressMutex.Unlock()
 	}
@@ -405,6 +429,7 @@ func (h *Handlers) runImport(feed Feed) {
 				updated++
 			} else {
 				errors++
+				addLog(fmt.Sprintf("Update error: %v", err))
 			}
 		} else {
 			newID := h.createProductFromFeed(ctx, productData, feedID)
@@ -428,6 +453,10 @@ func (h *Handlers) runImport(feed Feed) {
 			}
 			progressMutex.Unlock()
 		}
+
+		if (i+1)%500 == 0 {
+			addLog(fmt.Sprintf("Progress: %d/%d (created: %d, updated: %d)", i+1, len(items), created, updated))
+		}
 	}
 
 	addLog(fmt.Sprintf("Completed: %d created, %d updated, %d skipped, %d errors", created, updated, skipped, errors))
@@ -437,12 +466,19 @@ func (h *Handlers) runImport(feed Feed) {
 	if p, ok := importProgress[feedID]; ok {
 		p.Percent = 100
 		p.Processed = len(items)
+		p.Created = created
+		p.Updated = updated
+		p.Skipped = skipped
+		p.Errors = errors
 	}
 	progressMutex.Unlock()
 
 	h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='completed', product_count=$2 WHERE id=$1::uuid", feedID, created+updated)
 
+	// Sync to Elasticsearch
+	addLog("Syncing to Elasticsearch...")
 	h.syncFeedProductsToES(ctx, feedID)
+	addLog("Elasticsearch sync completed")
 }
 
 func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]interface{}, feedID string) string {
@@ -571,24 +607,29 @@ func (h *Handlers) syncFeedProductsToES(ctx context.Context, feedID string) {
 
 func mapFields(item map[string]interface{}, mapping map[string]string) map[string]interface{} {
 	result := make(map[string]interface{})
+	
+	// First apply explicit mappings
 	for sourceField, targetField := range mapping {
-		if targetField != "" {
-			if val, ok := item[sourceField]; ok {
+		if targetField != "" && targetField != "--" {
+			if val, ok := item[sourceField]; ok && val != nil && val != "" {
 				result[targetField] = val
 			}
 		}
 	}
+	
+	// Auto-mapping for common Heureka/XML fields
 	autoMap := map[string][]string{
-		"title":         {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE", "title", "name"},
-		"description":   {"DESCRIPTION", "POPIS", "DESC", "description"},
-		"price":         {"PRICE_VAT", "PRICE", "CENA", "price", "price_vat"},
-		"ean":           {"EAN", "EAN13", "GTIN", "BARCODE", "ean"},
-		"sku":           {"SKU", "ITEM_ID", "PRODUCTNO", "KOD", "sku", "item_id"},
-		"brand":         {"MANUFACTURER", "BRAND", "VYROBCE", "ZNACKA", "brand", "manufacturer"},
-		"image_url":     {"IMGURL", "IMG_URL", "IMAGE", "OBRAZOK", "image_url", "imgurl"},
-		"affiliate_url": {"URL", "ITEM_URL", "PRODUCT_URL", "url"},
-		"category":      {"CATEGORYTEXT", "CATEGORY", "KATEGORIA", "category"},
+		"title":         {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE", "title", "name", "product_name"},
+		"description":   {"DESCRIPTION", "POPIS", "DESC", "description", "long_description"},
+		"price":         {"PRICE_VAT", "PRICE", "CENA", "price", "price_vat", "cena_s_dph"},
+		"ean":           {"EAN", "EAN13", "GTIN", "BARCODE", "ean", "gtin", "barcode"},
+		"sku":           {"SKU", "ITEM_ID", "PRODUCTNO", "KOD", "sku", "item_id", "product_id", "PRODUCT_ID"},
+		"brand":         {"MANUFACTURER", "BRAND", "VYROBCE", "ZNACKA", "brand", "manufacturer", "znacka"},
+		"image_url":     {"IMGURL", "IMG_URL", "IMAGE", "OBRAZOK", "image_url", "imgurl", "image", "img"},
+		"affiliate_url": {"URL", "ITEM_URL", "PRODUCT_URL", "url", "product_url", "link"},
+		"category":      {"CATEGORYTEXT", "CATEGORY", "KATEGORIA", "category", "kategorie", "category_text"},
 	}
+	
 	for target, sources := range autoMap {
 		if result[target] == nil || result[target] == "" {
 			for _, src := range sources {
@@ -599,6 +640,7 @@ func mapFields(item map[string]interface{}, mapping map[string]string) map[strin
 			}
 		}
 	}
+	
 	return result
 }
 
@@ -619,6 +661,10 @@ func getFloat(m map[string]interface{}, key string) float64 {
 		switch f := v.(type) {
 		case float64:
 			return f
+		case int:
+			return float64(f)
+		case int64:
+			return float64(f)
 		case string:
 			s := strings.ReplaceAll(f, ",", ".")
 			s = strings.TrimSpace(s)
@@ -632,6 +678,7 @@ func getFloat(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
+// XML Parsing - simple string-based approach (no regex backreference)
 func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 	if itemPath == "" {
 		itemPath = "SHOPITEM"
@@ -646,6 +693,12 @@ func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 	for {
 		startIdx := strings.Index(content, startTag)
 		if startIdx == -1 {
+			break
+		}
+
+		// Find the closing > of start tag
+		tagEnd := strings.Index(content[startIdx:], ">")
+		if tagEnd == -1 {
 			break
 		}
 
@@ -670,11 +723,13 @@ func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 func parseXMLItem(xmlStr string) map[string]interface{} {
 	result := make(map[string]interface{})
 
+	// List of tags to extract
 	tags := []string{
 		"PRODUCTNAME", "PRODUCT", "DESCRIPTION", "PRICE_VAT", "PRICE",
 		"EAN", "ITEM_ID", "SKU", "MANUFACTURER", "BRAND",
 		"IMGURL", "URL", "CATEGORYTEXT", "CATEGORY",
-		"DELIVERY_DATE", "ITEM_TYPE",
+		"DELIVERY_DATE", "ITEM_TYPE", "PRODUCT_ID", "NAME",
+		"IMG_URL", "IMAGE", "GTIN", "BARCODE",
 	}
 
 	for _, tag := range tags {
@@ -688,21 +743,26 @@ func parseXMLItem(xmlStr string) map[string]interface{} {
 }
 
 func extractTagValue(xml string, tag string) string {
+	// Try <TAG>value</TAG>
 	startTag := "<" + tag + ">"
-	startTagAttr := "<" + tag + " "
 	endTag := "</" + tag + ">"
 
-	var startIdx int
-	if idx := strings.Index(xml, startTag); idx != -1 {
-		startIdx = idx + len(startTag)
-	} else if idx := strings.Index(xml, startTagAttr); idx != -1 {
-		closeIdx := strings.Index(xml[idx:], ">")
+	startIdx := strings.Index(xml, startTag)
+	if startIdx == -1 {
+		// Try <TAG attr="...">value</TAG>
+		startTagAttr := "<" + tag + " "
+		startIdx = strings.Index(xml, startTagAttr)
+		if startIdx == -1 {
+			return ""
+		}
+		// Find closing >
+		closeIdx := strings.Index(xml[startIdx:], ">")
 		if closeIdx == -1 {
 			return ""
 		}
-		startIdx = idx + closeIdx + 1
+		startIdx = startIdx + closeIdx + 1
 	} else {
-		return ""
+		startIdx = startIdx + len(startTag)
 	}
 
 	endIdx := strings.Index(xml[startIdx:], endTag)
@@ -712,8 +772,10 @@ func extractTagValue(xml string, tag string) string {
 
 	value := xml[startIdx : startIdx+endIdx]
 
-	if strings.HasPrefix(value, "<![CDATA[") && strings.HasSuffix(value, "]]>") {
-		value = value[9 : len(value)-3]
+	// Handle CDATA
+	if strings.HasPrefix(value, "<![CDATA[") {
+		value = strings.TrimPrefix(value, "<![CDATA[")
+		value = strings.TrimSuffix(value, "]]>")
 	}
 
 	return strings.TrimSpace(value)
@@ -725,12 +787,20 @@ func parseXMLPreview(data []byte, itemPath string) FeedPreview {
 	if len(items) > 5 {
 		items = items[:5]
 	}
-	fields := []string{}
-	if len(items) > 0 {
-		for k := range items[0] {
-			fields = append(fields, k)
+	
+	// Collect all unique fields from all sample items
+	fieldsMap := make(map[string]bool)
+	for _, item := range items {
+		for k := range item {
+			fieldsMap[k] = true
 		}
 	}
+	
+	fields := make([]string, 0, len(fieldsMap))
+	for k := range fieldsMap {
+		fields = append(fields, k)
+	}
+	
 	return FeedPreview{Fields: fields, Sample: items, TotalItems: totalItems}
 }
 
@@ -794,18 +864,31 @@ func parseFullJSON(data []byte) []map[string]interface{} {
 
 func parseFullCSV(data []byte) []map[string]interface{} {
 	var items []map[string]interface{}
-	firstLine := strings.Split(string(data), "\n")[0]
+	
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 {
+		return items
+	}
+	
+	firstLine := lines[0]
 	delimiter := ';'
 	if strings.Count(firstLine, ",") > strings.Count(firstLine, ";") {
 		delimiter = ','
 	}
+	if strings.Count(firstLine, "\t") > strings.Count(firstLine, string(delimiter)) {
+		delimiter = '\t'
+	}
+	
 	reader := csv.NewReader(bytes.NewReader(data))
 	reader.Comma = delimiter
 	reader.LazyQuotes = true
+	reader.FieldsPerRecord = -1 // Allow variable number of fields
+	
 	header, err := reader.Read()
 	if err != nil {
 		return items
 	}
+	
 	for {
 		row, err := reader.Read()
 		if err != nil {
@@ -814,7 +897,7 @@ func parseFullCSV(data []byte) []map[string]interface{} {
 		item := make(map[string]interface{})
 		for j, val := range row {
 			if j < len(header) {
-				item[header[j]] = val
+				item[header[j]] = strings.TrimSpace(val)
 			}
 		}
 		items = append(items, item)
