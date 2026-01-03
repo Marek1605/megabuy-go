@@ -402,7 +402,7 @@ func (c *Client) DeleteIndex() error {
 	if c.httpClient == nil {
 		return nil
 	}
-	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/%s", c.baseURL, c.index), nil)
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/%s", c.baseURL, "products"), nil)
 	if err != nil {
 		return err
 	}
