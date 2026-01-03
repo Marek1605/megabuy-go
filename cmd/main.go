@@ -54,6 +54,9 @@ func main() {
 	// ========== PUBLIC API ==========
 	api := app.Group("/api/v1")
 
+	// Search (Elasticsearch)
+	api.Get("/search", h.Search)
+
 	// Products
 	api.Get("/products", h.GetProducts)
 	api.Get("/products/featured", h.GetFeaturedProducts)
@@ -72,6 +75,9 @@ func main() {
 
 	// Dashboard
 	admin.Get("/dashboard", h.AdminDashboard)
+
+	// Elasticsearch Sync
+	admin.Post("/sync-elasticsearch", h.SyncToElasticsearch)
 
 	// Products
 	admin.Get("/products", h.AdminProducts)
@@ -96,5 +102,6 @@ func main() {
 	}
 
 	fmt.Printf("🚀 MegaBuy API starting on port %s\n", port)
+	fmt.Printf("📊 Elasticsearch: %s\n", os.Getenv("ELASTICSEARCH_URL"))
 	log.Fatal(app.Listen(":" + port))
 }
