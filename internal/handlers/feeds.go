@@ -790,4 +790,3 @@ func (h *Handlers) GetImportProgress(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{"success": true, "data": progress})
 }
-GOEOF
