@@ -33,7 +33,7 @@ func main() {
 
 	app := fiber.New(fiber.Config{
 		AppName:   "MegaBuy API",
-		BodyLimit: 50 * 1024 * 1024, // 50MB
+		BodyLimit: 50 * 1024 * 1024,
 	})
 
 	app.Use(logger.New())
@@ -43,59 +43,44 @@ func main() {
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
 	}))
 
-	// Static files for uploads
 	app.Static("/uploads", "./uploads")
 
-	// Health check
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	// ========== PUBLIC API ==========
 	api := app.Group("/api/v1")
 
-	// Search (Elasticsearch)
 	api.Get("/search", h.Search)
-
-	// Products
 	api.Get("/products", h.GetProducts)
 	api.Get("/products/featured", h.GetFeaturedProducts)
 	api.Get("/products/:slug", h.GetProductBySlug)
-
-	// Categories
 	api.Get("/categories", h.GetCategories)
 	api.Get("/categories/:slug", h.GetCategoryBySlug)
 	api.Get("/categories/:slug/products", h.GetProductsByCategory)
-
-	// Stats
 	api.Get("/stats", h.GetStats)
 
-	// ========== ADMIN API ==========
 	admin := api.Group("/admin")
-
-	// Dashboard
 	admin.Get("/dashboard", h.AdminDashboard)
-
-	// Elasticsearch Sync
 	admin.Post("/sync-elasticsearch", h.SyncToElasticsearch)
-
-	// Products
 	admin.Get("/products", h.AdminProducts)
 	admin.Get("/products/:id", h.AdminGetProduct)
 	admin.Post("/products", h.AdminCreateProduct)
 	admin.Put("/products/:id", h.AdminUpdateProduct)
 	admin.Delete("/products/:id", h.AdminDeleteProduct)
-
-	// Categories
 	admin.Get("/categories", h.AdminCategories)
 	admin.Post("/categories", h.AdminCreateCategory)
 	admin.Put("/categories/:id", h.AdminUpdateCategory)
 	admin.Delete("/categories/:id", h.AdminDeleteCategory)
-
-	// Upload
 	admin.Post("/upload", h.UploadImage)
+	admin.Get("/feeds", h.GetFeeds)
+	admin.Post("/feeds", h.CreateFeed)
+	admin.Post("/feeds/preview", h.PreviewFeed)
+	admin.Put("/feeds/:id", h.UpdateFeed)
+	admin.Delete("/feeds/:id", h.DeleteFeed)
+	admin.Post("/feeds/:id/import", h.StartImport)
+	admin.Get("/feeds/:id/progress", h.GetImportProgress)
 
-	// ========== START ==========
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
