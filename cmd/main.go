@@ -65,10 +65,19 @@ func main() {
 	api.Get("/categories/:slug/products", h.GetProductsByCategory)
 	api.Get("/stats", h.GetStats)
 
+	// Attribute stats (public for filtering)
+	api.Get("/attributes/stats", h.GetAttributeStats)
+
 	// Admin routes
 	admin := api.Group("/admin")
 	admin.Get("/dashboard", h.AdminDashboard)
 	admin.Post("/sync-elasticsearch", h.SyncToElasticsearch)
+	
+	// Filter settings
+	admin.Get("/filter-settings", h.GetFilterSettings)
+	admin.Put("/filter-settings", h.UpdateFilterSettings)
+	
+	// Products
 	admin.Get("/products", h.AdminProducts)
 	admin.Get("/products/:id", h.AdminGetProduct)
 	admin.Post("/products", h.AdminCreateProduct)
@@ -76,11 +85,17 @@ func main() {
 	admin.Delete("/products/:id", h.AdminDeleteProduct)
 	admin.Delete("/products/all", h.DeleteAllProducts)
 	admin.Post("/products/bulk", h.BulkDeleteProducts)
+	
+	// Categories
 	admin.Get("/categories", h.AdminCategories)
 	admin.Post("/categories", h.AdminCreateCategory)
 	admin.Put("/categories/:id", h.AdminUpdateCategory)
 	admin.Delete("/categories/:id", h.AdminDeleteCategory)
+	
+	// Upload
 	admin.Post("/upload", h.UploadImage)
+	
+	// Feeds
 	admin.Get("/feeds", h.GetFeeds)
 	admin.Post("/feeds", h.CreateFeed)
 	admin.Post("/feeds/preview", h.PreviewFeed)
