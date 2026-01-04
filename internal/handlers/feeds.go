@@ -44,6 +44,18 @@ type FeedPreview struct {
 	Sample       []map[string]interface{} `json:"sample"`
 	TotalItems   int                      `json:"total_items"`
 	DetectedType string                   `json:"detected_type,omitempty"`
+	Attributes   []AttributePreview       `json:"attributes,omitempty"`
+	Categories   []CategoryPreview        `json:"categories,omitempty"`
+}
+
+type AttributePreview struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type CategoryPreview struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 type ImportProgress struct {
@@ -200,7 +212,7 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "URL required"})
 	}
 
-	data, err := downloadFeedData(input.URL, 1024*1024) // 1MB for preview
+	data, err := downloadFeedData(input.URL, 2*1024*1024) // 2MB for preview
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Cannot download feed: " + err.Error()})
 	}
@@ -225,7 +237,7 @@ func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
 	var preview FeedPreview
 	switch detectedType {
 	case "xml":
-		preview = parseXMLPreview(data, itemPath)
+		preview = parseXMLPreviewWithAttributes(data, itemPath)
 	case "json":
 		preview = parseJSONPreview(data)
 	case "csv":
@@ -268,7 +280,6 @@ func (h *Handlers) StartImport(c *fiber.Ctx) error {
 }
 
 func downloadFeedData(url string, maxBytes int) ([]byte, error) {
-	// Support local files
 	if strings.HasPrefix(url, "/") {
 		data, err := os.ReadFile(url)
 		if err != nil {
@@ -280,7 +291,6 @@ func downloadFeedData(url string, maxBytes int) ([]byte, error) {
 		return data, nil
 	}
 
-	// HTTP download with robust settings
 	tr := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		DisableCompression:    false,
@@ -372,7 +382,7 @@ func (h *Handlers) runImport(feed Feed) {
 	var items []map[string]interface{}
 	switch feed.Type {
 	case "xml":
-		items = parseFullXML(data, feed.XMLItemPath)
+		items = parseFullXMLWithParams(data, feed.XMLItemPath)
 	case "json":
 		items = parseFullJSON(data)
 	case "csv":
@@ -422,8 +432,11 @@ func (h *Handlers) runImport(feed Feed) {
 			h.db.Pool.QueryRow(ctx, "SELECT id FROM products WHERE sku=$1", sku).Scan(&existingID)
 		}
 
+		// Get PARAM attributes from item
+		params := getParams(item)
+
 		if existingID != "" {
-			err := h.updateProductFromFeed(ctx, existingID, productData)
+			err := h.updateProductFromFeed(ctx, existingID, productData, params)
 			if err == nil {
 				updated++
 			} else {
@@ -431,7 +444,7 @@ func (h *Handlers) runImport(feed Feed) {
 				addLog(fmt.Sprintf("Update error: %v", err))
 			}
 		} else {
-			newID := h.createProductFromFeed(ctx, productData, feedID)
+			newID := h.createProductFromFeed(ctx, productData, feedID, params)
 			if newID != "" {
 				created++
 			} else {
@@ -474,13 +487,27 @@ func (h *Handlers) runImport(feed Feed) {
 
 	h.db.Pool.Exec(ctx, "UPDATE feeds SET last_status='completed', product_count=$2 WHERE id=$1::uuid", feedID, created+updated)
 
+	// Update category counts
+	h.db.Pool.Exec(ctx, `UPDATE categories SET product_count = (SELECT COUNT(*) FROM products WHERE category_id = categories.id AND is_active = true)`)
+
 	// Sync to Elasticsearch
 	addLog("Syncing to Elasticsearch...")
 	h.syncFeedProductsToES(ctx, feedID)
 	addLog("Elasticsearch sync completed")
 }
 
-func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]interface{}, feedID string) string {
+// getParams extracts PARAM attributes from parsed item
+func getParams(item map[string]interface{}) []map[string]string {
+	var params []map[string]string
+	if p, ok := item["_params"]; ok {
+		if paramList, ok := p.([]map[string]string); ok {
+			params = paramList
+		}
+	}
+	return params
+}
+
+func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]interface{}, feedID string, params []map[string]string) string {
 	productID := uuid.New()
 	title := getStr(data, "title")
 	slug := makeSlug(title)
@@ -496,7 +523,7 @@ func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]in
 
 	var categoryID *string
 	if category != "" {
-		catID := h.findOrCreateCategory(ctx, category)
+		catID := h.findOrCreateCategoryFeed(ctx, category)
 		if catID != "" {
 			categoryID = &catID
 		}
@@ -512,6 +539,9 @@ func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]in
 		return ""
 	}
 
+	// Save PARAM attributes
+	h.saveProductAttributes(ctx, productID.String(), params)
+
 	if categoryID != nil {
 		h.db.Pool.Exec(ctx, "UPDATE categories SET product_count = product_count + 1 WHERE id = $1::uuid", *categoryID)
 	}
@@ -519,7 +549,7 @@ func (h *Handlers) createProductFromFeed(ctx context.Context, data map[string]in
 	return productID.String()
 }
 
-func (h *Handlers) updateProductFromFeed(ctx context.Context, productID string, data map[string]interface{}) error {
+func (h *Handlers) updateProductFromFeed(ctx context.Context, productID string, data map[string]interface{}, params []map[string]string) error {
 	title := getStr(data, "title")
 	description := getStr(data, "description")
 	imageURL := getStr(data, "image_url")
@@ -530,11 +560,45 @@ func (h *Handlers) updateProductFromFeed(ctx context.Context, productID string, 
 		       image_url=COALESCE(NULLIF($4,''),image_url), price_min=$5, price_max=$5, updated_at=NOW()
 		WHERE id=$1::uuid
 	`, productID, title, description, imageURL, price)
+
+	if err == nil {
+		// Update PARAM attributes
+		h.saveProductAttributes(ctx, productID, params)
+	}
+
 	return err
 }
 
-func (h *Handlers) findOrCreateCategory(ctx context.Context, categoryText string) string {
-	parts := strings.Split(categoryText, "|")
+// saveProductAttributes saves PARAM tags to product_attributes table
+func (h *Handlers) saveProductAttributes(ctx context.Context, productID string, params []map[string]string) {
+	if len(params) == 0 {
+		return
+	}
+
+	// Delete existing attributes for this product
+	h.db.Pool.Exec(ctx, "DELETE FROM product_attributes WHERE product_id = $1::uuid", productID)
+
+	// Insert new attributes - using existing table structure (name, value, position)
+	for i, param := range params {
+		name := param["name"]
+		value := param["value"]
+		if name != "" && value != "" {
+			h.db.Pool.Exec(ctx, `
+				INSERT INTO product_attributes (id, product_id, name, value, position, created_at)
+				VALUES ($1::uuid, $2::uuid, $3, $4, $5, NOW())
+			`, uuid.New().String(), productID, name, value, i)
+		}
+	}
+}
+
+func (h *Handlers) findOrCreateCategoryFeed(ctx context.Context, categoryText string) string {
+	parts := strings.Split(categoryText, " | ")
+	if len(parts) == 1 {
+		parts = strings.Split(categoryText, "|")
+	}
+	if len(parts) == 1 {
+		parts = strings.Split(categoryText, " > ")
+	}
 	if len(parts) == 1 {
 		parts = strings.Split(categoryText, ">")
 	}
@@ -573,6 +637,10 @@ func (h *Handlers) findOrCreateCategory(ctx context.Context, categoryText string
 }
 
 func (h *Handlers) syncFeedProductsToES(ctx context.Context, feedID string) {
+	if h.es == nil {
+		return
+	}
+
 	rows, _ := h.db.Pool.Query(ctx, `
 		SELECT p.id, p.title, p.slug, COALESCE(p.description,''), COALESCE(p.short_description,''),
 		       COALESCE(p.ean,''), COALESCE(p.sku,''), COALESCE(p.brand,''),
@@ -607,7 +675,6 @@ func (h *Handlers) syncFeedProductsToES(ctx context.Context, feedID string) {
 func mapFields(item map[string]interface{}, mapping map[string]string) map[string]interface{} {
 	result := make(map[string]interface{})
 
-	// First apply explicit mappings
 	for sourceField, targetField := range mapping {
 		if targetField != "" && targetField != "--" && targetField != "-- Ignorovat --" {
 			if val, ok := item[sourceField]; ok && val != nil && val != "" {
@@ -616,17 +683,17 @@ func mapFields(item map[string]interface{}, mapping map[string]string) map[strin
 		}
 	}
 
-	// Auto-mapping for common Heureka/XML fields
 	autoMap := map[string][]string{
-		"title":         {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE", "title", "name", "product_name"},
-		"description":   {"DESCRIPTION", "POPIS", "DESC", "description", "long_description"},
-		"price":         {"PRICE_VAT", "PRICE", "CENA", "price", "price_vat", "cena_s_dph"},
-		"ean":           {"EAN", "EAN13", "GTIN", "BARCODE", "ean", "gtin", "barcode"},
-		"sku":           {"SKU", "ITEM_ID", "PRODUCTNO", "KOD", "sku", "item_id", "product_id", "PRODUCT_ID"},
-		"brand":         {"MANUFACTURER", "BRAND", "VYROBCE", "ZNACKA", "brand", "manufacturer", "znacka"},
-		"image_url":     {"IMGURL", "IMG_URL", "IMAGE", "OBRAZOK", "image_url", "imgurl", "image", "img"},
-		"affiliate_url": {"URL", "ITEM_URL", "PRODUCT_URL", "url", "product_url", "link"},
-		"category":      {"CATEGORYTEXT", "CATEGORY", "KATEGORIA", "category", "kategorie", "category_text"},
+		"title":             {"PRODUCTNAME", "PRODUCT", "NAME", "NAZOV", "TITLE", "title", "name", "product_name"},
+		"description":       {"DESCRIPTION", "POPIS", "DESC", "description", "long_description"},
+		"short_description": {"SHORT_DESCRIPTION", "SHORT_DESC", "KRATKY_POPIS"},
+		"price":             {"PRICE_VAT", "PRICE", "CENA", "price", "price_vat", "cena_s_dph"},
+		"ean":               {"EAN", "EAN13", "GTIN", "BARCODE", "ean", "gtin", "barcode"},
+		"sku":               {"SKU", "ITEM_ID", "PRODUCTNO", "KOD", "sku", "item_id", "product_id", "PRODUCT_ID"},
+		"brand":             {"MANUFACTURER", "BRAND", "VYROBCE", "ZNACKA", "brand", "manufacturer", "znacka"},
+		"image_url":         {"IMGURL", "IMG_URL", "IMAGE", "OBRAZOK", "image_url", "imgurl", "image", "img"},
+		"affiliate_url":     {"URL", "ITEM_URL", "PRODUCT_URL", "url", "product_url", "link"},
+		"category":          {"CATEGORYTEXT", "CATEGORY", "KATEGORIA", "category", "kategorie", "category_text"},
 	}
 
 	for target, sources := range autoMap {
@@ -677,8 +744,10 @@ func getFloat(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
-// XML Parsing using regex - handles single-line XML properly
-func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
+// ========== XML PARSING WITH PARAM SUPPORT ==========
+
+// parseFullXMLWithParams parses XML and extracts PARAM tags
+func parseFullXMLWithParams(data []byte, itemPath string) []map[string]interface{} {
 	if itemPath == "" {
 		itemPath = "SHOPITEM"
 	}
@@ -686,14 +755,13 @@ func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 	var items []map[string]interface{}
 	content := string(data)
 
-	// Use regex to find all SHOPITEM blocks
 	pattern := fmt.Sprintf(`(?s)<%s[^>]*>(.*?)</%s>`, itemPath, itemPath)
 	re := regexp.MustCompile(pattern)
 	matches := re.FindAllStringSubmatch(content, -1)
 
 	for _, match := range matches {
 		if len(match) > 1 {
-			item := parseXMLItemRegex(match[1])
+			item := parseXMLItemWithParams(match[1])
 			if len(item) > 0 {
 				items = append(items, item)
 			}
@@ -703,78 +771,170 @@ func parseFullXML(data []byte, itemPath string) []map[string]interface{} {
 	return items
 }
 
-func parseXMLItemRegex(xmlStr string) map[string]interface{} {
+// parseXMLItemWithParams extracts fields AND PARAM tags from XML item
+func parseXMLItemWithParams(xmlStr string) map[string]interface{} {
 	result := make(map[string]interface{})
 
-	// Tags to extract from Heureka XML
 	tags := []string{
 		"PRODUCTNAME", "PRODUCT", "DESCRIPTION", "PRICE_VAT", "PRICE",
 		"EAN", "ITEM_ID", "SKU", "MANUFACTURER", "BRAND",
 		"IMGURL", "URL", "CATEGORYTEXT", "CATEGORY",
 		"DELIVERY_DATE", "ITEM_TYPE", "PRODUCT_ID", "NAME",
+		"SHORT_DESCRIPTION", "PRODUCTNO",
 	}
 
 	for _, tag := range tags {
-		// Pattern handles both regular content and CDATA
-		// Match <TAG>content</TAG> or <TAG><![CDATA[content]]></TAG>
-		pattern := fmt.Sprintf(`<%s[^>]*>(?:<!\[CDATA\[)?([^<]*(?:<![^C]|<[^!]|<$)*)(?:\]\]>)?</%s>`, tag, tag)
-		re := regexp.MustCompile(pattern)
-		match := re.FindStringSubmatch(xmlStr)
-
-		if len(match) > 1 {
-			value := strings.TrimSpace(match[1])
-			// Clean up any remaining CDATA markers
-			value = strings.TrimPrefix(value, "<![CDATA[")
-			value = strings.TrimSuffix(value, "]]>")
-			value = strings.TrimSpace(value)
-			if value != "" {
-				result[tag] = value
-			}
-		} else {
-			// Simpler fallback pattern
-			pattern2 := fmt.Sprintf(`<%s>([^<]+)</%s>`, tag, tag)
-			re2 := regexp.MustCompile(pattern2)
-			match2 := re2.FindStringSubmatch(xmlStr)
-			if len(match2) > 1 {
-				value := strings.TrimSpace(match2[1])
-				if value != "" {
-					result[tag] = value
-				}
-			}
+		value := extractXMLTag(xmlStr, tag)
+		if value != "" {
+			result[tag] = value
 		}
 	}
 
-	// Special handling for CDATA fields
-	cdataTags := []string{"PRODUCTNAME", "PRODUCT", "DESCRIPTION", "CATEGORYTEXT", "MANUFACTURER"}
-	for _, tag := range cdataTags {
-		if result[tag] == nil {
-			pattern := fmt.Sprintf(`<%s[^>]*><!\[CDATA\[(.*?)\]\]></%s>`, tag, tag)
-			re := regexp.MustCompile(pattern)
-			match := re.FindStringSubmatch(xmlStr)
-			if len(match) > 1 {
-				value := strings.TrimSpace(match[1])
-				if value != "" {
-					result[tag] = value
-				}
-			}
-		}
+	// Extract PARAM tags - THIS IS THE KEY PART!
+	params := extractParams(xmlStr)
+	if len(params) > 0 {
+		result["_params"] = params
 	}
 
 	return result
 }
 
-func parseXMLPreview(data []byte, itemPath string) FeedPreview {
-	items := parseFullXML(data, itemPath)
-	totalItems := len(items)
-	if len(items) > 5 {
-		items = items[:5]
+// extractXMLTag extracts value from XML tag (handles CDATA)
+func extractXMLTag(xmlStr, tag string) string {
+	// Try CDATA first
+	cdataPattern := fmt.Sprintf(`<%s[^>]*><!\[CDATA\[(.*?)\]\]></%s>`, tag, tag)
+	re := regexp.MustCompile(cdataPattern)
+	match := re.FindStringSubmatch(xmlStr)
+	if len(match) > 1 {
+		return strings.TrimSpace(match[1])
 	}
 
-	// Collect all unique fields from all sample items
-	fieldsMap := make(map[string]bool)
+	// Try regular content
+	pattern := fmt.Sprintf(`<%s[^>]*>([^<]*)</%s>`, tag, tag)
+	re = regexp.MustCompile(pattern)
+	match = re.FindStringSubmatch(xmlStr)
+	if len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+
+	return ""
+}
+
+// extractParams extracts all PARAM tags from XML
+func extractParams(xmlStr string) []map[string]string {
+	var params []map[string]string
+
+	// Pattern for PARAM blocks
+	paramPattern := `(?s)<PARAM>(.*?)</PARAM>`
+	re := regexp.MustCompile(paramPattern)
+	matches := re.FindAllStringSubmatch(xmlStr, -1)
+
+	for _, match := range matches {
+		if len(match) > 1 {
+			paramContent := match[1]
+
+			// Extract PARAM_NAME
+			name := extractXMLTag(paramContent, "PARAM_NAME")
+			if name == "" {
+				name = extractXMLTag(paramContent, "NAME")
+			}
+
+			// Extract VAL (value)
+			value := extractXMLTag(paramContent, "VAL")
+			if value == "" {
+				value = extractXMLTag(paramContent, "VALUE")
+			}
+
+			if name != "" && value != "" {
+				params = append(params, map[string]string{
+					"name":  name,
+					"value": value,
+				})
+			}
+		}
+	}
+
+	return params
+}
+
+// parseXMLPreviewWithAttributes parses XML for preview including attributes stats
+func parseXMLPreviewWithAttributes(data []byte, itemPath string) FeedPreview {
+	items := parseFullXMLWithParams(data, itemPath)
+	totalItems := len(items)
+
+	// Collect attribute statistics
+	attrCounts := make(map[string]int)
+	catCounts := make(map[string]int)
+
 	for _, item := range items {
+		// Count attributes
+		if params, ok := item["_params"].([]map[string]string); ok {
+			for _, p := range params {
+				if name := p["name"]; name != "" {
+					attrCounts[name]++
+				}
+			}
+		}
+
+		// Count categories
+		if cat, ok := item["CATEGORYTEXT"].(string); ok && cat != "" {
+			catCounts[cat]++
+		} else if cat, ok := item["CATEGORY"].(string); ok && cat != "" {
+			catCounts[cat]++
+		}
+	}
+
+	// Convert to slices
+	var attributes []AttributePreview
+	for name, count := range attrCounts {
+		attributes = append(attributes, AttributePreview{Name: name, Count: count})
+	}
+
+	var categories []CategoryPreview
+	for name, count := range catCounts {
+		categories = append(categories, CategoryPreview{Name: name, Count: count})
+	}
+
+	// Get sample items (without _params for cleaner display)
+	sampleItems := items
+	if len(sampleItems) > 5 {
+		sampleItems = sampleItems[:5]
+	}
+
+	// Clean samples - show params separately
+	var cleanSamples []map[string]interface{}
+	for _, item := range sampleItems {
+		cleanItem := make(map[string]interface{})
+		for k, v := range item {
+			if k != "_params" {
+				cleanItem[k] = v
+			}
+		}
+		// Add param count
+		if params, ok := item["_params"].([]map[string]string); ok {
+			cleanItem["_param_count"] = len(params)
+			// Show first 3 params as preview
+			if len(params) > 0 {
+				preview := []string{}
+				for i, p := range params {
+					if i >= 3 {
+						break
+					}
+					preview = append(preview, fmt.Sprintf("%s: %s", p["name"], p["value"]))
+				}
+				cleanItem["_params_preview"] = preview
+			}
+		}
+		cleanSamples = append(cleanSamples, cleanItem)
+	}
+
+	// Collect all unique fields
+	fieldsMap := make(map[string]bool)
+	for _, item := range sampleItems {
 		for k := range item {
-			fieldsMap[k] = true
+			if k != "_params" {
+				fieldsMap[k] = true
+			}
 		}
 	}
 
@@ -783,15 +943,26 @@ func parseXMLPreview(data []byte, itemPath string) FeedPreview {
 		fields = append(fields, k)
 	}
 
-	// Ensure we return empty slice, not nil
-	if items == nil {
-		items = []map[string]interface{}{}
+	if cleanSamples == nil {
+		cleanSamples = []map[string]interface{}{}
 	}
 	if fields == nil {
 		fields = []string{}
 	}
+	if attributes == nil {
+		attributes = []AttributePreview{}
+	}
+	if categories == nil {
+		categories = []CategoryPreview{}
+	}
 
-	return FeedPreview{Fields: fields, Sample: items, TotalItems: totalItems}
+	return FeedPreview{
+		Fields:     fields,
+		Sample:     cleanSamples,
+		TotalItems: totalItems,
+		Attributes: attributes,
+		Categories: categories,
+	}
 }
 
 func parseJSONPreview(data []byte) FeedPreview {

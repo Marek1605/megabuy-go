@@ -2,15 +2,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/xml"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -25,20 +20,8 @@ import (
 )
 
 type Handlers struct {
-	db             *database.DB
-	es             *elasticsearch.Client
-	importProgress sync.Map
-}
-
-type ImportProgress struct {
-	FeedID    string `json:"feed_id"`
-	Status    string `json:"status"`
-	Total     int    `json:"total"`
-	Processed int    `json:"processed"`
-	Success   int    `json:"success"`
-	Failed    int    `json:"failed"`
-	StartedAt string `json:"started_at"`
-	Message   string `json:"message"`
+	db *database.DB
+	es *elasticsearch.Client
 }
 
 func New(db *database.DB) *Handlers {
@@ -65,13 +48,6 @@ func makeSlug(s string) string {
 		result = strings.ReplaceAll(result, "--", "-")
 	}
 	return strings.Trim(result, "-")
-}
-
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen]
 }
 
 // ========== SEARCH API (Elasticsearch) ==========
@@ -118,15 +94,13 @@ func (h *Handlers) SyncToElasticsearch(c *fiber.Ctx) error {
 	}
 
 	ctx := context.Background()
-
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT p.id, p.title, p.slug, COALESCE(p.description,''), COALESCE(p.short_description,''),
 		       COALESCE(p.ean,''), COALESCE(p.sku,''), COALESCE(p.brand,''),
 		       COALESCE(p.category_id::text,''), COALESCE(c.name,''), COALESCE(c.slug,''),
 		       COALESCE(p.image_url,''), p.price_min, p.price_max, COALESCE(p.stock_status,'instock'),
 		       p.is_active, COALESCE(p.is_featured, false), p.created_at
-		FROM products p
-		LEFT JOIN categories c ON p.category_id = c.id
+		FROM products p LEFT JOIN categories c ON p.category_id = c.id
 	`)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()})
@@ -346,7 +320,8 @@ func (h *Handlers) GetProductBySlug(c *fiber.Ctx) error {
 		images = append(images, imgURL)
 	}
 
-	attrRows, _ := h.db.Pool.Query(ctx, `SELECT attribute_name, attribute_value FROM product_attributes WHERE product_id = $1::uuid ORDER BY attribute_name`, id)
+	// Get attributes using existing table structure (name, value)
+	attrRows, _ := h.db.Pool.Query(ctx, `SELECT name, value FROM product_attributes WHERE product_id = $1::uuid ORDER BY position, name`, id)
 	defer attrRows.Close()
 	var attributes []fiber.Map
 	for attrRows.Next() {
@@ -523,24 +498,25 @@ func (h *Handlers) GetProductOffers(c *fiber.Ctx) error {
 func (h *Handlers) GetAttributeStats(c *fiber.Ctx) error {
 	ctx := context.Background()
 
+	// Using existing table structure (name, value)
 	rows, _ := h.db.Pool.Query(ctx, `
-		SELECT attribute_name, attribute_slug, 
+		SELECT name, 
 		       COUNT(DISTINCT product_id) as product_count,
-		       COUNT(DISTINCT attribute_value) as value_count
+		       COUNT(DISTINCT value) as value_count
 		FROM product_attributes 
-		GROUP BY attribute_name, attribute_slug 
+		GROUP BY name 
 		ORDER BY product_count DESC
 	`)
 	defer rows.Close()
 
 	var attributes []fiber.Map
 	for rows.Next() {
-		var name, slug string
+		var name string
 		var productCount, valueCount int
-		rows.Scan(&name, &slug, &productCount, &valueCount)
+		rows.Scan(&name, &productCount, &valueCount)
 		attributes = append(attributes, fiber.Map{
 			"name":          name,
-			"slug":          slug,
+			"slug":          makeSlug(name),
 			"product_count": productCount,
 			"value_count":   valueCount,
 		})
@@ -919,418 +895,4 @@ func (h *Handlers) UploadImage(c *fiber.Ctx) error {
 	baseURL := c.BaseURL()
 	url := fmt.Sprintf("%s/uploads/%s", baseURL, filename)
 	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"url": url, "filename": filename}})
-}
-
-// ========== FEED HANDLERS ==========
-
-type HeurekaFeed struct {
-	XMLName   xml.Name         `xml:"SHOP"`
-	ShopItems []HeurekaProduct `xml:"SHOPITEM"`
-}
-
-type HeurekaProduct struct {
-	ItemID          string         `xml:"ITEM_ID"`
-	ProductName     string         `xml:"PRODUCTNAME"`
-	Product         string         `xml:"PRODUCT"`
-	Description     string         `xml:"DESCRIPTION"`
-	URL             string         `xml:"URL"`
-	ImageURL        string         `xml:"IMGURL"`
-	ImageURLAlt     []string       `xml:"IMGURL_ALTERNATIVE"`
-	Price           float64        `xml:"PRICE_VAT"`
-	PriceVAT        float64        `xml:"PRICE_VAT"`
-	Manufacturer    string         `xml:"MANUFACTURER"`
-	CategoryText    string         `xml:"CATEGORYTEXT"`
-	EAN             string         `xml:"EAN"`
-	ProductNo       string         `xml:"PRODUCTNO"`
-	DeliveryDate    string         `xml:"DELIVERY_DATE"`
-	Params          []HeurekaParam `xml:"PARAM"`
-	ExtraMessage    string         `xml:"EXTRA_MESSAGE"`
-	ItemGroupID     string         `xml:"ITEMGROUP_ID"`
-	Accessory       []string       `xml:"ACCESSORY"`
-	Gift            string         `xml:"GIFT"`
-	ExtendedWarrant string         `xml:"EXTENDED_WARRANTY"`
-}
-
-type HeurekaParam struct {
-	ParamName string `xml:"PARAM_NAME"`
-	Val       string `xml:"VAL"`
-}
-
-func (h *Handlers) GetFeeds(c *fiber.Ctx) error {
-	ctx := context.Background()
-	rows, err := h.db.Pool.Query(ctx, `SELECT id, name, url, feed_type, COALESCE(category_mapping,'{}'), is_active, last_import, import_count, created_at FROM feeds ORDER BY created_at DESC`)
-	if err != nil {
-		log.Printf("GetFeeds error: %v", err)
-		return c.JSON(fiber.Map{"success": true, "data": []fiber.Map{}})
-	}
-	defer rows.Close()
-
-	var feeds []fiber.Map
-	for rows.Next() {
-		var id, name, url, feedType, categoryMapping string
-		var isActive bool
-		var lastImport *time.Time
-		var importCount int
-		var createdAt time.Time
-		rows.Scan(&id, &name, &url, &feedType, &categoryMapping, &isActive, &lastImport, &importCount, &createdAt)
-		feeds = append(feeds, fiber.Map{
-			"id": id, "name": name, "url": url, "feed_type": feedType,
-			"category_mapping": categoryMapping, "is_active": isActive,
-			"last_import": lastImport, "import_count": importCount, "created_at": createdAt,
-		})
-	}
-	if feeds == nil {
-		feeds = []fiber.Map{}
-	}
-	return c.JSON(fiber.Map{"success": true, "data": feeds})
-}
-
-func (h *Handlers) CreateFeed(c *fiber.Ctx) error {
-	var input struct {
-		Name            string `json:"name"`
-		URL             string `json:"url"`
-		FeedType        string `json:"feed_type"`
-		CategoryMapping string `json:"category_mapping"`
-		IsActive        bool   `json:"is_active"`
-	}
-	if err := c.BodyParser(&input); err != nil {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"})
-	}
-	if input.Name == "" || input.URL == "" {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Name and URL required"})
-	}
-	if input.FeedType == "" {
-		input.FeedType = "heureka"
-	}
-
-	ctx := context.Background()
-	id := uuid.New()
-	_, err := h.db.Pool.Exec(ctx, `INSERT INTO feeds (id, name, url, feed_type, category_mapping, is_active, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())`, id, input.Name, input.URL, input.FeedType, input.CategoryMapping, input.IsActive)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()})
-	}
-	return c.Status(201).JSON(fiber.Map{"success": true, "data": fiber.Map{"id": id.String()}})
-}
-
-func (h *Handlers) PreviewFeed(c *fiber.Ctx) error {
-	var input struct {
-		URL string `json:"url"`
-	}
-	if err := c.BodyParser(&input); err != nil {
-		log.Printf("PreviewFeed: Invalid request body: %v", err)
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request body"})
-	}
-
-	if input.URL == "" {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "URL is required"})
-	}
-
-	log.Printf("PreviewFeed: Fetching URL: %s", input.URL)
-
-	// Create HTTP client with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(input.URL)
-	if err != nil {
-		log.Printf("PreviewFeed: Failed to fetch: %v", err)
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Failed to fetch feed: " + err.Error()})
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": fmt.Sprintf("Feed returned status %d", resp.StatusCode)})
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("PreviewFeed: Failed to read body: %v", err)
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Failed to read feed: " + err.Error()})
-	}
-
-	log.Printf("PreviewFeed: Downloaded %d bytes", len(body))
-
-	var feed HeurekaFeed
-	if err := xml.Unmarshal(body, &feed); err != nil {
-		log.Printf("PreviewFeed: Failed to parse XML: %v", err)
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Failed to parse feed: " + err.Error()})
-	}
-
-	log.Printf("PreviewFeed: Parsed %d items", len(feed.ShopItems))
-
-	// Get sample products with safe string handling
-	limit := 5
-	if len(feed.ShopItems) < limit {
-		limit = len(feed.ShopItems)
-	}
-
-	var samples []fiber.Map
-	for i := 0; i < limit; i++ {
-		item := feed.ShopItems[i]
-		var params []fiber.Map
-		for _, p := range item.Params {
-			if p.ParamName != "" {
-				params = append(params, fiber.Map{"name": p.ParamName, "value": p.Val})
-			}
-		}
-
-		// Safe truncation
-		desc := item.Description
-		if len(desc) > 200 {
-			desc = desc[:200] + "..."
-		}
-
-		samples = append(samples, fiber.Map{
-			"title":       item.ProductName,
-			"description": desc,
-			"price":       item.PriceVAT,
-			"image":       item.ImageURL,
-			"category":    item.CategoryText,
-			"brand":       item.Manufacturer,
-			"ean":         item.EAN,
-			"params":      params,
-		})
-	}
-
-	// Get unique categories
-	catMap := make(map[string]int)
-	for _, item := range feed.ShopItems {
-		if item.CategoryText != "" {
-			catMap[item.CategoryText]++
-		}
-	}
-	var categories []fiber.Map
-	for cat, count := range catMap {
-		categories = append(categories, fiber.Map{"name": cat, "count": count})
-	}
-
-	// Get unique attributes (PARAMs)
-	attrMap := make(map[string]int)
-	for _, item := range feed.ShopItems {
-		for _, p := range item.Params {
-			if p.ParamName != "" {
-				attrMap[p.ParamName]++
-			}
-		}
-	}
-	var attributes []fiber.Map
-	for attr, count := range attrMap {
-		attributes = append(attributes, fiber.Map{"name": attr, "count": count})
-	}
-
-	return c.JSON(fiber.Map{
-		"success": true,
-		"data": fiber.Map{
-			"total_products": len(feed.ShopItems),
-			"samples":        samples,
-			"categories":     categories,
-			"attributes":     attributes,
-		},
-	})
-}
-
-func (h *Handlers) UpdateFeed(c *fiber.Ctx) error {
-	feedID := c.Params("id")
-	var input struct {
-		Name            string `json:"name"`
-		URL             string `json:"url"`
-		FeedType        string `json:"feed_type"`
-		CategoryMapping string `json:"category_mapping"`
-		IsActive        bool   `json:"is_active"`
-	}
-	if err := c.BodyParser(&input); err != nil {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": "Invalid request"})
-	}
-
-	ctx := context.Background()
-	_, err := h.db.Pool.Exec(ctx, `UPDATE feeds SET name = $2, url = $3, feed_type = $4, category_mapping = $5, is_active = $6, updated_at = NOW() WHERE id = $1::uuid`, feedID, input.Name, input.URL, input.FeedType, input.CategoryMapping, input.IsActive)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()})
-	}
-	return c.JSON(fiber.Map{"success": true, "message": "Feed updated"})
-}
-
-func (h *Handlers) DeleteFeed(c *fiber.Ctx) error {
-	feedID := c.Params("id")
-	ctx := context.Background()
-	_, err := h.db.Pool.Exec(ctx, "DELETE FROM feeds WHERE id = $1::uuid", feedID)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"success": false, "error": err.Error()})
-	}
-	return c.JSON(fiber.Map{"success": true, "message": "Feed deleted"})
-}
-
-func (h *Handlers) StartImport(c *fiber.Ctx) error {
-	feedID := c.Params("id")
-	ctx := context.Background()
-
-	var feedURL, feedType string
-	err := h.db.Pool.QueryRow(ctx, "SELECT url, feed_type FROM feeds WHERE id = $1::uuid", feedID).Scan(&feedURL, &feedType)
-	if err != nil {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": "Feed not found"})
-	}
-
-	go h.importFeed(feedID, feedURL, feedType)
-
-	return c.JSON(fiber.Map{"success": true, "message": "Import started"})
-}
-
-func (h *Handlers) importFeed(feedID, feedURL, feedType string) {
-	ctx := context.Background()
-
-	progress := &ImportProgress{
-		FeedID:    feedID,
-		Status:    "downloading",
-		StartedAt: time.Now().Format(time.RFC3339),
-	}
-	h.importProgress.Store(feedID, progress)
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(feedURL)
-	if err != nil {
-		progress.Status = "failed"
-		progress.Message = "Failed to download: " + err.Error()
-		return
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	progress.Status = "parsing"
-
-	var feed HeurekaFeed
-	if err := xml.Unmarshal(body, &feed); err != nil {
-		progress.Status = "failed"
-		progress.Message = "Failed to parse: " + err.Error()
-		return
-	}
-
-	progress.Total = len(feed.ShopItems)
-	progress.Status = "importing"
-
-	for i, item := range feed.ShopItems {
-		categoryID := h.findOrCreateCategory(ctx, item.CategoryText)
-
-		var existingID string
-		h.db.Pool.QueryRow(ctx, "SELECT id FROM products WHERE ean = $1 OR sku = $2", item.EAN, item.ItemID).Scan(&existingID)
-
-		productID := existingID
-		if productID == "" {
-			productID = uuid.New().String()
-		}
-
-		slug := makeSlug(item.ProductName)
-
-		stockStatus := "instock"
-		if item.DeliveryDate != "" && item.DeliveryDate != "0" {
-			stockStatus = "outofstock"
-		}
-
-		price := item.PriceVAT
-		if price == 0 {
-			price = item.Price
-		}
-
-		if existingID == "" {
-			_, err = h.db.Pool.Exec(ctx, `
-				INSERT INTO products (id, category_id, title, slug, description, ean, sku, brand, image_url, price_min, price_max, stock_status, affiliate_url, is_active, created_at, updated_at)
-				VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12, true, NOW(), NOW())
-			`, productID, categoryID, item.ProductName, slug, item.Description, item.EAN, item.ItemID, item.Manufacturer, item.ImageURL, price, stockStatus, item.URL)
-		} else {
-			_, err = h.db.Pool.Exec(ctx, `
-				UPDATE products SET category_id = $2::uuid, title = $3, description = $4, brand = $5, image_url = $6, price_min = $7, price_max = $7, stock_status = $8, affiliate_url = $9, updated_at = NOW()
-				WHERE id = $1::uuid
-			`, productID, categoryID, item.ProductName, item.Description, item.Manufacturer, item.ImageURL, price, stockStatus, item.URL)
-		}
-
-		if err == nil {
-			progress.Success++
-
-			for j, imgURL := range item.ImageURLAlt {
-				h.db.Pool.Exec(ctx, `
-					INSERT INTO product_images (id, product_id, url, position, is_main) 
-					VALUES ($1::uuid, $2::uuid, $3, $4, false)
-					ON CONFLICT DO NOTHING
-				`, uuid.New().String(), productID, imgURL, j+1)
-			}
-
-			// Save attributes (PARAM tags)
-			h.db.Pool.Exec(ctx, "DELETE FROM product_attributes WHERE product_id = $1::uuid", productID)
-			for _, param := range item.Params {
-				if param.ParamName != "" && param.Val != "" {
-					attrSlug := makeSlug(param.ParamName)
-					h.db.Pool.Exec(ctx, `
-						INSERT INTO product_attributes (id, product_id, attribute_name, attribute_slug, attribute_value)
-						VALUES ($1::uuid, $2::uuid, $3, $4, $5)
-					`, uuid.New().String(), productID, param.ParamName, attrSlug, param.Val)
-				}
-			}
-		} else {
-			progress.Failed++
-		}
-
-		progress.Processed = i + 1
-	}
-
-	h.db.Pool.Exec(ctx, "UPDATE feeds SET last_import = NOW(), import_count = import_count + $2 WHERE id = $1::uuid", feedID, progress.Success)
-
-	h.db.Pool.Exec(ctx, `
-		UPDATE categories SET product_count = (
-			SELECT COUNT(*) FROM products WHERE category_id = categories.id AND is_active = true
-		)
-	`)
-
-	progress.Status = "completed"
-	progress.Message = fmt.Sprintf("Imported %d products, %d failed", progress.Success, progress.Failed)
-}
-
-func (h *Handlers) findOrCreateCategory(ctx context.Context, categoryText string) string {
-	if categoryText == "" {
-		return ""
-	}
-
-	parts := strings.Split(categoryText, " | ")
-	if len(parts) == 0 {
-		parts = []string{categoryText}
-	}
-
-	var parentID *string
-	var lastCategoryID string
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-
-		slug := makeSlug(part)
-
-		var catID string
-		var err error
-
-		if parentID == nil {
-			err = h.db.Pool.QueryRow(ctx, "SELECT id FROM categories WHERE slug = $1 AND parent_id IS NULL", slug).Scan(&catID)
-		} else {
-			err = h.db.Pool.QueryRow(ctx, "SELECT id FROM categories WHERE slug = $1 AND parent_id = $2::uuid", slug, *parentID).Scan(&catID)
-		}
-
-		if err != nil {
-			catID = uuid.New().String()
-			if parentID == nil {
-				h.db.Pool.Exec(ctx, `INSERT INTO categories (id, name, slug, is_active, created_at, updated_at) VALUES ($1::uuid, $2, $3, true, NOW(), NOW())`, catID, part, slug)
-			} else {
-				h.db.Pool.Exec(ctx, `INSERT INTO categories (id, parent_id, name, slug, is_active, created_at, updated_at) VALUES ($1::uuid, $2::uuid, $3, $4, true, NOW(), NOW())`, catID, *parentID, part, slug)
-			}
-		}
-
-		parentID = &catID
-		lastCategoryID = catID
-	}
-
-	return lastCategoryID
-}
-
-func (h *Handlers) GetImportProgress(c *fiber.Ctx) error {
-	feedID := c.Params("id")
-	if progress, ok := h.importProgress.Load(feedID); ok {
-		return c.JSON(fiber.Map{"success": true, "data": progress})
-	}
-	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"status": "idle"}})
 }
