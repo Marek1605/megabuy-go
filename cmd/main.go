@@ -79,13 +79,12 @@ func main() {
 	
 	// Products
 	admin.Get("/products", h.AdminProducts)
+	admin.Delete("/products/all", h.DeleteAllProducts)
+	admin.Post("/products/bulk", h.BulkDeleteProducts)
 	admin.Get("/products/:id", h.AdminGetProduct)
 	admin.Post("/products", h.AdminCreateProduct)
 	admin.Put("/products/:id", h.AdminUpdateProduct)
 	admin.Delete("/products/:id", h.AdminDeleteProduct)
-	admin.Delete("/products/all", h.DeleteAllProducts)
-	admin.Post("/products/bulk", h.BulkDeleteProducts)
-	
 	// Categories
 	admin.Get("/categories", h.AdminCategories)
 	admin.Post("/categories", h.AdminCreateCategory)
