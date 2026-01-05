@@ -756,6 +756,15 @@ func (h *Handlers) DeleteAllProducts(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"success": true, "message": fmt.Sprintf("Deleted %d products", count), "count": count})
 }
 
+func (h *Handlers) DeleteAllCategories(c *fiber.Ctx) error {
+	ctx := context.Background()
+	var count int
+	h.db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM categories").Scan(&count)
+	h.db.Pool.Exec(ctx, "UPDATE products SET category_id = NULL")
+	h.db.Pool.Exec(ctx, "DELETE FROM categories")
+	return c.JSON(fiber.Map{"success": true, "message": fmt.Sprintf("Deleted %d categories", count), "count": count})
+}
+
 func (h *Handlers) BulkDeleteProducts(c *fiber.Ctx) error {
 	var input struct {
 		IDs    []string `json:"ids"`

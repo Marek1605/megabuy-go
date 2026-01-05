@@ -86,6 +86,7 @@ func main() {
 	admin.Put("/products/:id", h.AdminUpdateProduct)
 	admin.Delete("/products/:id", h.AdminDeleteProduct)
 	// Categories
+	admin.Delete("/categories/all", h.DeleteAllCategories)
 	admin.Get("/categories", h.AdminCategories)
 	admin.Post("/categories", h.AdminCreateCategory)
 	admin.Put("/categories/:id", h.AdminUpdateCategory)
