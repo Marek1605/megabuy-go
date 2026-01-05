@@ -156,7 +156,7 @@ func (h *Handlers) GetProducts(c *fiber.Ctx) error {
 	argNum := 1
 
 	if cat := c.Query("category"); cat != "" {
-		whereClause += fmt.Sprintf(" AND c.slug = $%d", argNum)
+		whereClause += fmt.Sprintf(" AND p.category_id IN (WITH RECURSIVE subcats AS (SELECT id FROM categories WHERE slug = $%d UNION ALL SELECT c.id FROM categories c JOIN subcats s ON c.parent_id = s.id) SELECT id FROM subcats)", argNum)
 		args = append(args, cat)
 		argNum++
 	}
