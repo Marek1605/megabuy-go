@@ -932,3 +932,60 @@ func (h *Handlers) UploadImage(c *fiber.Ctx) error {
 	url := fmt.Sprintf("%s/uploads/%s", baseURL, filename)
 	return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"url": url, "filename": filename}})
 }
+
+func (h *Handlers) GetAttributeValues(c *fiber.Ctx) error {
+	ctx := context.Background()
+	attrName := c.Query("name")
+	categorySlug := c.Query("category")
+	
+	if attrName == "" {
+		return c.Status(400).JSON(fiber.Map{"success": false, "error": "name required"})
+	}
+	
+	var query string
+	var args []interface{}
+	
+	if categorySlug != "" {
+		query = `
+			SELECT pa.value, COUNT(DISTINCT pa.product_id) as cnt
+			FROM product_attributes pa
+			JOIN products p ON pa.product_id = p.id
+			WHERE pa.name = $1 AND p.category_id IN (
+				WITH RECURSIVE subcats AS (
+					SELECT id FROM categories WHERE slug = $2
+					UNION ALL
+					SELECT c.id FROM categories c JOIN subcats s ON c.parent_id = s.id
+				) SELECT id FROM subcats
+			) AND p.is_active = true
+			GROUP BY pa.value
+			ORDER BY cnt DESC
+			LIMIT 100
+		`
+		args = []interface{}{attrName, categorySlug}
+	} else {
+		query = `
+			SELECT value, COUNT(DISTINCT product_id) as cnt
+			FROM product_attributes
+			WHERE name = $1
+			GROUP BY value
+			ORDER BY cnt DESC
+			LIMIT 100
+		`
+		args = []interface{}{attrName}
+	}
+	
+	rows, _ := h.db.Pool.Query(ctx, query, args...)
+	defer rows.Close()
+	
+	var values []fiber.Map
+	for rows.Next() {
+		var value string
+		var count int
+		rows.Scan(&value, &count)
+		values = append(values, fiber.Map{"value": value, "count": count})
+	}
+	if values == nil {
+		values = []fiber.Map{}
+	}
+	return c.JSON(fiber.Map{"success": true, "data": values})
+}

@@ -67,6 +67,7 @@ func main() {
 
 	// Attribute stats (public for filtering)
 	api.Get("/attributes/stats", h.GetAttributeStats)
+	api.Get("/attributes/values", h.GetAttributeValues)
 
 	// Admin routes
 	admin := api.Group("/admin")
