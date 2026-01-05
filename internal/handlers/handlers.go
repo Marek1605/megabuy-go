@@ -441,20 +441,47 @@ func (h *Handlers) GetCategoryBySlug(c *fiber.Ctx) error {
 func (h *Handlers) GetProductsByCategory(c *fiber.Ctx) error {
 	slug := c.Params("slug")
 	ctx := context.Background()
+	
 	var categoryID string
 	err := h.db.Pool.QueryRow(ctx, "SELECT id FROM categories WHERE slug = $1", slug).Scan(&categoryID)
 	if err != nil {
 		return c.Status(404).JSON(fiber.Map{"success": false, "error": "Category not found"})
 	}
-
-	rows, _ := h.db.Pool.Query(ctx, `SELECT p.id, p.title, p.slug, COALESCE(p.image_url,''), p.price_min, p.price_max, COALESCE(p.brand,'') FROM products p WHERE p.category_id = $1::uuid AND p.is_active=true ORDER BY p.created_at DESC`, categoryID)
-	defer rows.Close()
-	var products []fiber.Map
+	
+	// Get all subcategory IDs recursively
+	rows, _ := h.db.Pool.Query(ctx, `
+		WITH RECURSIVE subcats AS (
+			SELECT id FROM categories WHERE id = $1::uuid
+			UNION ALL
+			SELECT c.id FROM categories c JOIN subcats s ON c.parent_id = s.id
+		)
+		SELECT id FROM subcats
+	`, categoryID)
+	var categoryIDs []string
 	for rows.Next() {
-		var id, title, slug, img, brand string
+		var id string
+		rows.Scan(&id)
+		categoryIDs = append(categoryIDs, id)
+	}
+	rows.Close()
+	
+	if len(categoryIDs) == 0 {
+		categoryIDs = []string{categoryID}
+	}
+	
+	prodRows, _ := h.db.Pool.Query(ctx, `
+		SELECT p.id, p.title, p.slug, COALESCE(p.image_url,''), p.price_min, p.price_max, COALESCE(p.brand,'')
+		FROM products p 
+		WHERE p.category_id = ANY($1::uuid[]) AND p.is_active=true 
+		ORDER BY p.created_at DESC`, categoryIDs)
+	defer prodRows.Close()
+	
+	var products []fiber.Map
+	for prodRows.Next() {
+		var id, title, pslug, img, brand string
 		var pmin, pmax float64
-		rows.Scan(&id, &title, &slug, &img, &pmin, &pmax, &brand)
-		products = append(products, fiber.Map{"id": id, "title": title, "slug": slug, "image_url": img, "price_min": pmin, "price_max": pmax, "brand": brand})
+		prodRows.Scan(&id, &title, &pslug, &img, &pmin, &pmax, &brand)
+		products = append(products, fiber.Map{"id": id, "title": title, "slug": pslug, "image_url": img, "price_min": pmin, "price_max": pmax, "brand": brand})
 	}
 	if products == nil {
 		products = []fiber.Map{}
